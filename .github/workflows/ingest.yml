@@ -132,10 +132,19 @@ jobs:
           python - <<'PY'
           import json, os
           from huggingface_hub import hf_hub_download
+          from huggingface_hub.errors import EntryNotFoundError
           repo = os.environ["HF_LIBRARY_DATASET_REPO"]
-          path = hf_hub_download(repo_id=repo, repo_type="dataset",
-                                 filename="_worker/library_checkpoint.json",
-                                 revision=os.environ["HF_LIBRARY_DATASET_REVISION"],
-                                 token=os.environ["HF_TOKEN"])
-          print(json.dumps(json.load(open(path, encoding="utf-8")), indent=1)[:1200])
+          try:
+              path = hf_hub_download(repo_id=repo, repo_type="dataset",
+                                     filename="_worker/library_checkpoint.json",
+                                     revision=os.environ["HF_LIBRARY_DATASET_REVISION"],
+                                     token=os.environ["HF_TOKEN"])
+          except EntryNotFoundError:
+              print("no checkpoint yet: this run committed nothing (dry run or first run)")
+              raise SystemExit(0)
+          data = json.load(open(path, encoding="utf-8"))
+          last = data.get("last_commit") or {}
+          print(json.dumps({k: v for k, v in data.items() if k != "last_commit"}, indent=1))
+          print("last commit:", last.get("commit", ""),
+                "| files it expects:", len(last.get("expected") or {}))
           PY

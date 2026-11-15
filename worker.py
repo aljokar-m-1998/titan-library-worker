@@ -532,7 +532,7 @@ def catalog_row_ok(row: dict) -> bool:
 
 
 def split_list(value: str | None) -> list[str]:
-    return [part.strip() for part in (value or "").split(";") if part.strip()]
+    return [" ".join(part.split()) for part in (value or "").split(";") if part.strip()]
 
 
 def load_catalog(interval: float) -> tuple[list[dict], dict]:
@@ -561,8 +561,8 @@ def load_catalog(interval: float) -> tuple[list[dict], dict]:
             stats["bad_id"] += 1
             continue
         stats["english_text"] += 1
-        rows.append({"id": gid, "title": (row.get("Title") or "").strip(),
-                     "author": (row.get("Authors") or "").strip(),
+        rows.append({"id": gid, "title": " ".join((row.get("Title") or "").split()),
+                     "author": " ".join((row.get("Authors") or "").split()),
                      "subjects": split_list(row.get("Subjects")),
                      "bookshelves": split_list(row.get("Bookshelves")),
                      "issued": (row.get("Issued") or "").strip()})
@@ -1268,7 +1268,8 @@ def selftest() -> int:
           catalog_row_ok({"Type": "Text", "Language": "en"})
           and not catalog_row_ok({"Type": "Text", "Language": "en; fr"})
           and not catalog_row_ok({"Type": "Sound", "Language": "en"}))
-    check("subject list split", split_list("A; B ;") == ["A", "B"])
+    check("subject list split and embedded CRLF collapsed",
+          split_list("A\r\nB; C ;") == ["A B", "C"])
     print(f"self-test: {len(failures)} failures", flush=True)
     return 1 if failures else 0
 
