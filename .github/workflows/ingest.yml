@@ -116,6 +116,77 @@ jobs:
           cat verify-run.json
           exit $status
 
+      - name: audit the public shelf without a token
+        if: always()
+        run: |
+          set +e
+          python - <<'PY' > shelf-audit.json
+          import io, json, os, sys, urllib.request
+          import pyarrow.parquet as pq
+          import worker
+
+          repo = os.environ["HF_LIBRARY_DATASET_REPO"]
+          base = f"https://huggingface.co/datasets/{repo}/resolve/{os.environ['HF_LIBRARY_DATASET_REVISION']}/"
+          problems = []
+
+          def public(path):
+              request = urllib.request.Request(base + path, headers=worker.UA)
+              with urllib.request.urlopen(request, timeout=120) as response:
+                  return response.read()
+
+          def want(ok, label, detail=""):
+              print(("PASS " if ok else "FAIL ") + label + (f" {detail}" if detail else ""),
+                    file=sys.stderr)
+              if not ok:
+                  problems.append(label)
+
+          ledger = json.loads(public("ledger.json"))
+          queue = ledger.get("queue") or []
+          entries = [e for e in queue if e.get("source") == "gutendex"]
+          want(bool(entries), "ledger.json is publicly readable", f"{len(entries)} gutendex entries")
+          needed = {"key", "source", "external_id", "language", "title", "author", "cover",
+                    "stage", "status", "chapters", "chapters_ready", "chars", "word_count"}
+          absent = sorted({k for e in entries for k in needed - set(e)})
+          want(not absent, "every entry carries the fields the client reads", ",".join(absent))
+          want(not any(c in (e.get("title") or "") + (e.get("author") or "")
+                       for e in entries for c in "\r\n"), "no raw control characters in titles")
+
+          table = pq.read_table(io.BytesIO(public("catalog.parquet")))
+          want(table.schema.names == worker.CATALOG_SCHEMA.names, "catalog schema matches the writer")
+          want(table.num_rows == len(entries), "catalog rows equal ledger entries",
+               f"{table.num_rows} vs {len(entries)}")
+
+          ranked = sorted(entries, key=lambda e: int(e.get("rank") or 0), reverse=True)
+          pick = next((e for e in ranked if e.get("cover")), None)
+          want(pick is not None, "a recent book has a cover")
+          if pick:
+              gid = int(pick["external_id"])
+              folder = worker.book_folder(gid)
+              book = json.loads(public(f"{folder}/book.json"))
+              chapters = book.get("chapters") or []
+              want(book.get("external_id") == gid and book.get("language") == "en",
+                   "book.json identity", f"{folder}")
+              want(len(chapters) == int(pick.get("chapters") or 0),
+                   "book.json chapters equal the ledger count", f"{len(chapters)}")
+              first = public(f"{folder}/ch001_en.txt").decode("utf-8")
+              want(bool(first.strip()) and "*** START" not in first and "*** END" not in first,
+                   "first chapter is clean body text", f"{len(first)} chars")
+              cover = public(f"{folder}/cover.jpg")
+              want(cover[:3] == b"\xff\xd8\xff", "cover.jpg is a real JPEG served anonymously",
+                   f"{len(cover)} bytes")
+              want(book.get("audio_available") is False
+                   and all(not c.get("audio_urls") for c in chapters),
+                   "the new book references no audio")
+          print(json.dumps({"audited_book": pick and pick.get("external_id"),
+                            "ledger_entries": len(entries), "catalog_rows": table.num_rows,
+                            "problems": problems}, indent=1))
+          raise SystemExit(1 if problems else 0)
+          PY
+          status=$?
+          set -e
+          cat shelf-audit.json
+          exit $status
+
       - name: upload this run's reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -124,6 +195,7 @@ jobs:
           path: |
             ingest-run.json
             verify-run.json
+            shelf-audit.json
           if-no-files-found: ignore
 
       - name: show where the shelf stands
