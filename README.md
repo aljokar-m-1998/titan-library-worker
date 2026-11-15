@@ -78,6 +78,16 @@ a contents listing, a dedication and three real chapters must yield exactly thre
 chapters with the right titles, plus known-answer vectors for the git blob sha1, the
 path guard and the strict `en` / `Text` filter.
 
+Hash equality proves the hub stores what the runner wrote, not that a reader can fetch
+it. The `audit the public shelf without a token` step closes that layer: it pulls
+`ledger.json`, `catalog.parquet`, `_worker/library_index.json` and one recent book's
+`book.json`, `ch001_en.txt` and `cover.jpg` over the public CDN **anonymously**, checks
+the catalog schema and row count against the ledger, requires the full field set of
+every entry the index marks `origin=catalog`, and requires a positive `word_count` on
+every chapter of the sampled book — the number the client sums. Gateway-era entries are
+reported as INFO rather than failed, because the client reads their word counts from
+`book.json`, never from the ledger.
+
 ## Running
 
 ```bash
@@ -117,3 +127,8 @@ gh secret set HF_TOKEN --repo aljokar-m-1998/titan-library-worker
 - `download_count` is `0` for catalog books: `pg_catalog.csv.gz` does not carry it.
 - The first chapter absorbs the title page and any front matter, exactly as the
   gateway's chapteriser does. Spans are lossless slices of the original text.
+- The EAD index builder still enumerates `books/gutendex` **one level deep**
+  (`american-english-daily-kmp/scripts/build_catalog_index.py:33` and `:287-292`), so it
+  finds the 63 legacy books and skips the sharded ones with a warning. Teaching it
+  two-level enumeration is a separate, deferred change — the books are stored and
+  verified either way.

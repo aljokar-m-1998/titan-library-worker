@@ -197,6 +197,8 @@ jobs:
                    "the new book references no audio")
           print(json.dumps({"audited_book": pick and pick.get("external_id"),
                             "ledger_entries": len(entries), "catalog_rows": table.num_rows,
+                            "books_ingested": len(fresh), "books_gateway_era": len(legacy),
+                            "covers_in_index": sum(1 for m in index.values() if m.get("cover")),
                             "problems": problems}, indent=1))
           raise SystemExit(1 if problems else 0)
           PY
