@@ -1136,7 +1136,6 @@ def run(args) -> dict:
                 row["verified_at"] = stamp()
         STATE_HOOK["expected"] = expected
         dirty = True
-        ledger["updated_at"] = stamp()
         last_batch_seconds = time.time() - batch_start
         history.append({"batch": batch_number, "books_committed": len(built),
                         "books_failed": len(failures), "failures": failures[:10],
@@ -1270,6 +1269,30 @@ def selftest() -> int:
           and not catalog_row_ok({"Type": "Sound", "Language": "en"}))
     check("subject list split and embedded CRLF collapsed",
           split_list("A\r\nB; C ;") == ["A B", "C"])
+
+    # A state flush must rewrite ledger.json byte-for-byte as the batch committed it,
+    # otherwise --verify-last compares the repo against a stale expectation and fails
+    # a run whose books are all intact.
+    class _Budget:
+        def report(self):
+            return {}
+
+    probe = {"version": 1, "queue": [], "updated_at": ""}
+    merge_ledger(probe, [{"id": 1, "title": "T", "author": "A", "cover_url": "",
+                          "chapters": 1, "chars": 10, "words": 2,
+                          "text_bytes": 10, "asset_bytes": 20}])
+    committed = expectations(
+        {"ledger.json": json.dumps(probe, ensure_ascii=False).encode("utf-8")})
+    # Advance the clock deterministically: a flush that re-stamps the ledger would
+    # otherwise look identical whenever both calls land in the same second.
+    real_stamp = globals()["stamp"]
+    globals()["stamp"] = lambda: "1999-01-01T00:00:00+00:00"
+    try:
+        flushed = state_files({"books": {}}, probe, _Budget(), 1, committed, "")
+    finally:
+        globals()["stamp"] = real_stamp
+    check("state flush rewrites the committed ledger byte-for-byte",
+          git_blob_sha1(flushed["ledger.json"]) == committed["ledger.json"][1])
     print(f"self-test: {len(failures)} failures", flush=True)
     return 1 if failures else 0
 
