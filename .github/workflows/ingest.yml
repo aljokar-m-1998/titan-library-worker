@@ -148,12 +148,12 @@ jobs:
 
           # The client reads word counts from book.json chapters, never from ledger entries,
           # and the 63 gateway-era entries predate this writer. Hold the full contract only
-          # against the books the checkpoint says this worker ingested.
-          index = json.loads(public("_worker/library_checkpoint.json")).get("books") or {}
+          # against the books the index says this worker ingested.
+          index = json.loads(public("_worker/library_index.json")).get("books") or {}
           written = {int(g) for g, m in index.items() if m.get("origin") == "catalog"}
           fresh = [e for e in entries if int(e.get("external_id") or 0) in written]
           legacy = [e for e in entries if int(e.get("external_id") or 0) not in written]
-          want(bool(fresh), "the checkpoint identifies the ingested books",
+          want(bool(fresh), "the index identifies the ingested books",
                f"{len(fresh)} ingested, {len(legacy)} gateway-era")
           needed = {"key", "source", "external_id", "language", "title", "author", "cover",
                     "stage", "status", "chapters", "chapters_ready", "chars", "word_count"}
