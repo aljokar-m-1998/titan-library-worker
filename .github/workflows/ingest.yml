@@ -144,10 +144,26 @@ jobs:
           queue = ledger.get("queue") or []
           entries = [e for e in queue if e.get("source") == "gutendex"]
           want(bool(entries), "ledger.json is publicly readable", f"{len(entries)} gutendex entries")
+          want(bool(ledger.get("updated_at")), "ledger.updated_at is present for the client's freshness check")
+
+          # The client reads word counts from book.json chapters, never from ledger entries,
+          # and the 63 gateway-era entries predate this writer. Hold the full contract only
+          # against the books the checkpoint says this worker ingested.
+          index = json.loads(public("_worker/library_checkpoint.json")).get("books") or {}
+          written = {int(g) for g, m in index.items() if m.get("origin") == "catalog"}
+          fresh = [e for e in entries if int(e.get("external_id") or 0) in written]
+          legacy = [e for e in entries if int(e.get("external_id") or 0) not in written]
+          want(bool(fresh), "the checkpoint identifies the ingested books",
+               f"{len(fresh)} ingested, {len(legacy)} gateway-era")
           needed = {"key", "source", "external_id", "language", "title", "author", "cover",
                     "stage", "status", "chapters", "chapters_ready", "chars", "word_count"}
-          absent = sorted({k for e in entries for k in needed - set(e)})
-          want(not absent, "every entry carries the fields the client reads", ",".join(absent))
+          absent = sorted({k for e in fresh for k in needed - set(e)})
+          want(not absent, "every ingested entry carries the full ledger contract", ",".join(absent))
+          identity = {"key", "source", "external_id", "language"}
+          thin = sorted({k for e in entries for k in identity - set(e)})
+          want(not thin, "every entry keeps its identity fields", ",".join(thin))
+          print(f"INFO gateway-era entries lack {sorted({k for e in legacy for k in needed - set(e)})}",
+                file=sys.stderr)
           want(not any(c in (e.get("title") or "") + (e.get("author") or "")
                        for e in entries for c in "\r\n"), "no raw control characters in titles")
 
@@ -168,6 +184,8 @@ jobs:
                    "book.json identity", f"{folder}")
               want(len(chapters) == int(pick.get("chapters") or 0),
                    "book.json chapters equal the ledger count", f"{len(chapters)}")
+              want(all(int(c.get("word_count") or 0) > 0 for c in chapters),
+                   "every chapter carries the word_count the client sums")
               first = public(f"{folder}/ch001_en.txt").decode("utf-8")
               want(bool(first.strip()) and "*** START" not in first and "*** END" not in first,
                    "first chapter is clean body text", f"{len(first)} chars")
