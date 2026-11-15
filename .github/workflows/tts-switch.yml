@@ -1,0 +1,59 @@
+name: switch Titan-Library narration on the gateway
+
+# off -> LIBRARY_WORKER=0, the gateway stops ingesting and narrating Titan-Library
+#        and GitHub Actions becomes the only writer of that dataset.
+# on  -> restores the previous behaviour exactly.
+# Restarts the Space, so chat / learn / cinema are briefly interrupted (~1-2 min).
+
+on:
+  workflow_dispatch:
+    inputs:
+      state:
+        description: "off retires server-side TTS for Titan-Library; on restores it"
+        required: true
+        default: "off"
+        type: choice
+        options:
+          - "off"
+          - "on"
+
+concurrency:
+  group: titan-gateway-tts-switch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  switch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_GATEWAY_SPACE: ${{ vars.HF_GATEWAY_SPACE || 'M-hv1/Titan-Gateway' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: install the hub client
+        run: python -m pip install --no-cache-dir "huggingface_hub>=1.31,<2"
+
+      - name: set LIBRARY_WORKER and restart the space
+        run: |
+          set +e
+          python space_tts.py --state "${{ github.event.inputs.state }}" > tts-switch.json
+          status=$?
+          set -e
+          cat tts-switch.json
+          exit $status
+
+      - name: upload the switch report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tts-switch-${{ github.run_number }}
+          path: tts-switch.json
+          if-no-files-found: ignore

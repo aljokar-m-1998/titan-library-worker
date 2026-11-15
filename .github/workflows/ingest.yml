@@ -1,0 +1,141 @@
+name: ingest Gutenberg texts into Titan-Library
+
+# Every byte is fetched, cleaned, packaged and committed on GitHub's runner.
+# Text + metadata + covers only; the EAD client narrates on device.
+# One job, one writer: the gateway's library worker is off (see tts-switch.yml),
+# so nothing else touches ledger.json or _worker/ while this runs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch_size:
+        description: "books per commit this run"
+        required: false
+        default: "25"
+      commit_files:
+        description: "max files per commit (state rides along in the same commit)"
+        required: false
+        default: "1500"
+      batches:
+        description: "maximum commits this run may attempt"
+        required: false
+        default: "40"
+      max_commits_per_run:
+        description: "hard cap on commits, independent of batches"
+        required: false
+        default: "12"
+      fetch_interval:
+        description: "seconds between Project Gutenberg requests"
+        required: false
+        default: "1.0"
+      max_minutes:
+        description: "wall-clock limit for the ingest step"
+        required: false
+        default: "110"
+      dry_run:
+        description: "fetch and clean 3 books, commit nothing"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+  schedule:
+    # once a day, off the hour, so a run never shares a rate window with another writer
+    - cron: "17 3 * * *"
+
+concurrency:
+  group: titan-library-ingest
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ingest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_LIBRARY_DATASET_REPO: ${{ vars.HF_LIBRARY_DATASET_REPO || 'M-hv1/Titan-Library' }}
+      HF_LIBRARY_DATASET_REVISION: ${{ vars.HF_LIBRARY_DATASET_REVISION || 'main' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: install only what the ingester needs
+        run: |
+          python -m pip install --no-cache-dir --upgrade pip
+          python -m pip install --no-cache-dir "huggingface_hub>=1.31,<2" "pyarrow>=15"
+
+      - name: self-test the cleaner and the path guard (no network)
+        run: python worker.py --self-test
+
+      - name: prove the token and the dataset are readable
+        run: |
+          python - <<'PY'
+          import os
+          from huggingface_hub import HfApi
+          api = HfApi(token=os.environ["HF_TOKEN"])
+          repo = os.environ["HF_LIBRARY_DATASET_REPO"]
+          info = api.repo_info(repo, repo_type="dataset")
+          files = api.list_repo_files(repo, repo_type="dataset")
+          print("dataset", info.id, "private", info.private, "sha", info.sha)
+          print("files:", len(files), "| ledger.json present:", "ledger.json" in files)
+          print("mp3 already on the shelf:", sum(f.endswith(".mp3") for f in files))
+          PY
+
+      - name: ingest
+        run: |
+          set +e
+          python worker.py \
+            --batch-size "${{ github.event.inputs.batch_size || (github.event_name == 'schedule' && '250' || '25') }}" \
+            --commit-files "${{ github.event.inputs.commit_files || '1500' }}" \
+            --batches "${{ github.event.inputs.batches || '40' }}" \
+            --max-commits-per-run "${{ github.event.inputs.max_commits_per_run || vars.MAX_COMMITS_PER_RUN || '12' }}" \
+            --fetch-interval "${{ github.event.inputs.fetch_interval || '1.0' }}" \
+            --max-minutes "${{ github.event.inputs.max_minutes || '110' }}" \
+            --reserve-minutes 12 --min-commit-interval 25 --min-remaining 150 \
+            ${{ (github.event.inputs.dry_run == 'true' || (github.event_name == 'schedule' && vars.INGEST_DRY_RUN == 'true')) && '--dry-run' || '' }} \
+            > ingest-run.json
+          status=$?
+          set -e
+          cat ingest-run.json
+          exit $status
+
+      - name: independent remote verification of the last commit
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          set +e
+          python worker.py --verify-last > verify-run.json
+          status=$?
+          set -e
+          cat verify-run.json
+          exit $status
+
+      - name: upload this run's reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ingest-run-${{ github.run_number }}
+          path: |
+            ingest-run.json
+            verify-run.json
+          if-no-files-found: ignore
+
+      - name: show where the shelf stands
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, os
+          from huggingface_hub import hf_hub_download
+          repo = os.environ["HF_LIBRARY_DATASET_REPO"]
+          path = hf_hub_download(repo_id=repo, repo_type="dataset",
+                                 filename="_worker/library_checkpoint.json",
+                                 revision=os.environ["HF_LIBRARY_DATASET_REVISION"],
+                                 token=os.environ["HF_TOKEN"])
+          print(json.dumps(json.load(open(path, encoding="utf-8")), indent=1)[:1200])
+          PY
