@@ -175,8 +175,15 @@ class Budget:
         self.bytes = 0
         self.last_checkpoint: dict = {}
         self.stop_reason = ""
+        self.deadline = 0.0
+        self.parked = False
+        self.last_24h = 0
 
     def commits_last_24h(self) -> int:
+        # Once parked, the report reuses the count taken before the marker commit:
+        # the park promises the hub no further requests at all, reads included.
+        if self.parked:
+            return self.last_24h
         day_ago = time.time() - 86400
         count = 0
         for commit in self.api.list_repo_commits(REPO, repo_type="dataset", revision=REVISION):
@@ -189,6 +196,7 @@ class Budget:
                 count += 1
             else:
                 break
+        self.last_24h = count
         return count
 
     def allow(self) -> str:
@@ -201,9 +209,19 @@ class Budget:
         self.headers = api_headers()
         self.state = rate_state(self.headers)
         remaining = self.state.get("remaining")
-        if remaining is not None and remaining < self.min_remaining:
-            return (f"rate window low: remaining={remaining} "
-                    f"reset_in={self.state.get('reset_in')}s of q={self.state.get('quota')}")
+        # A low window is not a refusal: wait it out inside this run and keep pumping
+        # toward the commit cap. Only a refused commit parks the pipeline until tomorrow.
+        while remaining is not None and remaining < self.min_remaining:
+            reset = self.state.get("reset_in")
+            pause = (reset if reset is not None else (self.state.get("window") or 300)) + 5
+            if self.deadline and time.time() + pause > self.deadline:
+                return (f"rate window low and no time left to wait: remaining={remaining} "
+                        f"pause={pause}s deadline_in={int(self.deadline - time.time())}s")
+            log(f"rate window low (remaining={remaining}); waiting {pause}s inside this run")
+            time.sleep(pause)
+            self.headers = api_headers()
+            self.state = rate_state(self.headers)
+            remaining = self.state.get("remaining")
         return ""
 
     def allow_ignoring_pacing(self) -> str:
@@ -260,14 +278,35 @@ def backoff_until(api) -> int:
         return 0
 
 
-def save_backoff(api, budget: Budget) -> None:
-    """Record when it is safe to try again, so a waiting run costs zero requests."""
+def prime_last_commit(api, budget: Budget) -> dict:
+    """Carry the previous run's verified expectations forward. A marker or a state flush
+    written before this run's first commit must not erase what --verify-last reads."""
+    raw = read_file(api, "_worker/library_checkpoint.json")
+    if not raw:
+        return {}
+    try:
+        last = json.loads(raw).get("last_commit") or {}
+        expected = {p: tuple(v) for p, v in (last.get("expected") or {}).items()}
+    except (json.JSONDecodeError, AttributeError, TypeError, ValueError):
+        return {}
+    if expected:
+        budget.last_checkpoint = {"commit": last.get("commit", "")}
+    return expected
+
+
+def save_backoff(api, budget: Budget) -> int:
+    """A refused commit parks the pipeline until the next UTC midnight. Writing this
+    marker is the one last request; nothing else is sent until the new day starts."""
     reset = budget.state.get("reset_in") or budget.state.get("retry_after") or 300
+    now = int(time.time())
+    next_utc_midnight = ((now // 86400) + 1) * 86400
+    not_before = max(next_utc_midnight, now + reset + 60)
     payload = {
         "_worker/backoff.json": json.dumps({
             "since": stamp(),
-            "not_before_epoch": int(time.time() + reset + 60),
-            "wait_seconds": reset + 60,
+            "not_before_epoch": not_before,
+            "not_before_utc": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(not_before)),
+            "wait_seconds": not_before - now,
             "reason": budget.stop_reason,
             "last_rate_limit_headers": budget.headers,
             "rate_window": budget.state,
@@ -278,8 +317,10 @@ def save_backoff(api, budget: Budget) -> None:
     }
     api.create_commit(REPO, [CommitOperationAdd(path_in_repo=k, path_or_fileobj=v)
                              for k, v in sorted(payload.items())],
-                      commit_message="library: backoff marker (rate limited)",
+                      commit_message="library: backoff marker (commit refused, parked until UTC midnight)",
                       repo_type="dataset", revision=REVISION)
+    budget.parked = True
+    return not_before
 
 
 class Stopped(Exception):
@@ -980,12 +1021,14 @@ def run(args) -> dict:
     until = backoff_until(api)
     if until and time.time() < until:
         return {"waiting_for_backoff": True, "seconds_left": int(until - time.time()),
+                "not_before_epoch": until,
                 "reason": "a previous run was rate limited; this run exits without touching the hub"}
     budget = Budget(api, args.max_commits_per_run, args.min_commit_interval, args.min_remaining)
     if args.reserve_minutes >= args.max_minutes:
         return {"refused": f"max_minutes {args.max_minutes} must exceed reserve_minutes "
                            f"{args.reserve_minutes}, otherwise no batch can start",
                 "batches": [], "commit_budget": budget.report()}
+    carried = prime_last_commit(api, budget)
     index = load_state(api)
     ledger = load_ledger(api)
     legacy = backfill_legacy(api, index, ledger)
@@ -993,7 +1036,7 @@ def run(args) -> dict:
     known = {int(k) for k, v in index["books"].items() if v.get("status") == "verified_remote"}
     known |= ledger_ids(ledger)
     candidates = [row for row in catalog if row["id"] not in known]
-    scan = candidates[:args.scan or args.batch_size * 4]
+    scan = candidates[:args.scan or args.batch_size * 40]
     present = existing_books(api, [row["id"] for row in scan])
     queue = [row for row in scan if row["id"] not in present]
     log(f"catalog {stats} | candidates {len(candidates)} | scanned {len(scan)} | "
@@ -1018,13 +1061,15 @@ def run(args) -> dict:
 
     STATE_HOOK.clear()
     STATE_HOOK.update({"api": api, "index": index, "ledger": ledger, "budget": budget,
-                       "expected": {}})
+                       "expected": carried})
     started = time.time()
+    budget.deadline = started + (args.max_minutes - args.reserve_minutes) * 60
     history: list[dict] = []
     cursor = 0
     carry: dict | None = None
     dirty = bool(legacy)
     refused = ""
+    parked_until = 0
     last_batch_seconds = 0.0
     for batch_number in range(1, args.batches + 1):
         if ((time.time() - started) + last_batch_seconds + args.reserve_minutes * 60
@@ -1072,7 +1117,6 @@ def run(args) -> dict:
             budget.stop_reason = block
             history.append({"batch": batch_number, "books_fetched": len(built),
                             "commit_blocked": block})
-            save_backoff(api, budget)
             dirty = False
             break
 
@@ -1114,7 +1158,14 @@ def run(args) -> dict:
             history.append({"batch": batch_number, "refused": refused, "error": str(error)[:500],
                             "rate_window": budget.state, "rolled_back_books": len(built)})
             if waited:
-                save_backoff(api, budget)
+                try:
+                    parked_until = save_backoff(api, budget)
+                    history[-1]["parked_until_epoch"] = parked_until
+                    history[-1]["parked_until_utc"] = time.strftime(
+                        "%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(parked_until))
+                except Exception as marker_error:
+                    history[-1]["marker_write_failed"] = str(marker_error)[:300]
+                    budget.stop_reason += f" | marker_write_failed: {str(marker_error)[:200]}"
                 dirty = False
             log(budget.stop_reason)
             break
@@ -1167,7 +1218,8 @@ def run(args) -> dict:
             "legacy_backfilled": legacy, "books_indexed": len(index["books"]),
             "by_status": dict(Counter(r.get("status", "?") for r in index["books"].values())),
             "candidates": len(candidates), "queue_scanned": len(queue),
-            "batches": history, "refused": refused, "commit_budget": budget.report(),
+            "batches": history, "refused": refused, "parked_until_epoch": parked_until,
+            "commit_budget": budget.report(),
             "minutes": round((time.time() - started) / 60, 1)}
 
 
@@ -1293,6 +1345,137 @@ def selftest() -> int:
         globals()["stamp"] = real_stamp
     check("state flush rewrites the committed ledger byte-for-byte",
           git_blob_sha1(flushed["ledger.json"]) == committed["ledger.json"][1])
+
+    # A refused commit parks the pipeline until the next UTC midnight; a run that starts
+    # before then must exit without sending one request. Both halves are proved here with
+    # a stub api and a frozen clock, so the check needs no network.
+    class _Api:
+        def __init__(self):
+            self.commits = []
+            self.reads = 0
+
+        def list_repo_commits(self, *a, **k):
+            self.reads += 1
+            return iter(())
+
+        def create_commit(self, repo, operations, **k):
+            self.commits.append({op.path_in_repo: op.path_or_fileobj for op in operations})
+            return "stub-commit"
+
+    class _Proceeded(Exception):
+        pass
+
+    class _BudgetProbe:
+        def __init__(self, *a, **k):
+            raise _Proceeded()
+
+    fake = _Api()
+    parked = Budget(fake, 500, 0.0, 150)
+    parked.state = {"remaining": 12, "reset_in": 45}
+    parked.stop_reason = "commit refused by the hub (quota): 429"
+    hook = dict(STATE_HOOK)
+    STATE_HOOK.clear()
+    STATE_HOOK.update({"index": {"books": {}}, "ledger": {"version": 1, "queue": []},
+                       "budget": parked, "expected": {}})
+    real_time, real_sleep = time.time, time.sleep
+    real_api, real_read, real_budget = hf_api, read_file, Budget
+    real_headers = api_headers
+    frozen = 1_800_000_000                     # mid-day, so midnight beats reset+60
+    midnight = ((frozen // 86400) + 1) * 86400
+    try:
+        time.time = lambda: float(frozen)
+        epoch = save_backoff(fake, parked)
+        marker = json.loads(fake.commits[-1]["_worker/backoff.json"])
+        check("a refused commit parks until the next UTC midnight",
+              epoch == midnight and marker["not_before_epoch"] == midnight
+              and midnight % 86400 == 0, f"epoch={epoch} midnight={midnight}")
+        reads_before = fake.reads
+        parked.report()
+        check("the report after a park sends no further request",
+              fake.reads == reads_before, f"extra_reads={fake.reads - reads_before}")
+
+        sent = len(fake.commits)
+        globals()["hf_api"] = lambda: fake
+        globals()["read_file"] = lambda api, path, required=False: (
+            json.dumps({"not_before_epoch": epoch}).encode() if path == "_worker/backoff.json"
+            else None)
+        globals()["Budget"] = _BudgetProbe
+        probe_args = argparse.Namespace(max_commits_per_run=500, min_commit_interval=5.0,
+                                        min_remaining=150)
+        time.time = lambda: float(epoch - 60)
+        before = run(probe_args)
+        check("a run before the marker exits at once and sends nothing",
+              before.get("waiting_for_backoff") is True and len(fake.commits) == sent,
+              f"requests={len(fake.commits) - sent}")
+        time.time = lambda: float(epoch + 1)
+        try:
+            run(probe_args)
+            proceeded = False
+        except _Proceeded:
+            proceeded = True
+        check("a run after the marker proceeds, so the gate is time-sensitive", proceeded)
+        globals()["Budget"] = real_budget
+
+        # A refusal on the very first batch must not erase the checkpoint the previous
+        # run verified, or --verify-last goes red on a park that is meant to be green.
+        previous = {"last_commit": {"commit": "https://hub/previous",
+                                    "expected": {"ledger.json": ["blob", "abc123", 12]}}}
+        globals()["read_file"] = lambda api, path, required=False: (
+            json.dumps(previous).encode() if path == "_worker/library_checkpoint.json" else None)
+        heir = real_budget(fake, 500, 0.0, 150)
+        carried = prime_last_commit(fake, heir)
+        check("a run carries the previous verified expectations forward",
+              carried == {"ledger.json": ("blob", "abc123", 12)}
+              and heir.last_checkpoint.get("commit") == "https://hub/previous",
+              f"carried={len(carried)}")
+        STATE_HOOK["expected"] = carried
+        save_backoff(fake, heir)
+        written = json.loads(fake.commits[-1]["_worker/library_checkpoint.json"])
+        check("the marker commit keeps the previous checkpoint verifiable",
+              written["last_commit"] == previous["last_commit"],
+              f"last_commit={written['last_commit']}")
+        check("run() actually carries it, not just the helper",
+              "prime_last_commit" in run.__code__.co_names)
+
+        sleeps: list[float] = []
+        time.sleep = lambda s: sleeps.append(s)
+        windows = iter([{"RateLimit": '"api";r=12;t=7', "RateLimit-Policy": '"api";q=1000;w=300'},
+                        {"RateLimit": '"api";r=980;t=293', "RateLimit-Policy": '"api";q=1000;w=300'}])
+        globals()["api_headers"] = lambda *a, **k: next(windows)
+        time.time = real_time
+        waiter = Budget(fake, 500, 0.0, 150)
+        check("a low rate window waits inside the run and then continues",
+              waiter.allow() == "" and sleeps == [12.0], f"sleeps={sleeps}")
+        globals()["api_headers"] = lambda *a, **k: {"RateLimit": '"api";r=12;t=200'}
+        tight = Budget(fake, 500, 0.0, 150)
+        tight.deadline = time.time() + 30
+        block = tight.allow()
+        check("a low window near the deadline stops instead of waiting past it",
+              block.startswith("rate window low and no time left") and sleeps == [12.0],
+              f"block={block!r}")
+
+        # The park is a planned stop, so the job must be green; a refusal that could not
+        # write its marker has no guaranteed wait and must stay red.
+        real_run, real_argv, real_stdout = run, sys.argv, sys.stdout
+        globals()["run"] = lambda args: {"refused": "commit refused by the hub (quota)",
+                                         "parked_until_epoch": midnight}
+        sys.argv = ["worker.py"]
+        sys.stdout = io.StringIO()
+        try:
+            parked_code = main()
+            globals()["run"] = lambda args: {"refused": "commit refused by the hub (quota)"}
+            unmarked_code = main()
+        finally:
+            globals()["run"], sys.argv, sys.stdout = real_run, real_argv, real_stdout
+        check("an intentional quota park exits green", parked_code == 0, f"code={parked_code}")
+        check("a refusal whose marker failed stays red", unmarked_code == 1,
+              f"code={unmarked_code}")
+    finally:
+        time.time, time.sleep = real_time, real_sleep
+        globals()["hf_api"], globals()["read_file"] = real_api, real_read
+        globals()["Budget"], globals()["api_headers"] = real_budget, real_headers
+        STATE_HOOK.clear()
+        STATE_HOOK.update(hook)
     print(f"self-test: {len(failures)} failures", flush=True)
     return 1 if failures else 0
 
@@ -1302,15 +1485,15 @@ def main() -> int:
     signal.signal(signal.SIGINT, _on_signal)
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-size", type=int, default=25)
-    parser.add_argument("--commit-files", type=int, default=1500)
-    parser.add_argument("--batches", type=int, default=40)
+    parser.add_argument("--commit-files", type=int, default=2500)
+    parser.add_argument("--batches", type=int, default=500)
     parser.add_argument("--scan", type=int, default=0)
-    parser.add_argument("--fetch-interval", type=float, default=1.0)
-    parser.add_argument("--max-minutes", type=float, default=110.0)
-    parser.add_argument("--reserve-minutes", type=float, default=12.0)
+    parser.add_argument("--fetch-interval", type=float, default=0.3)
+    parser.add_argument("--max-minutes", type=float, default=320.0)
+    parser.add_argument("--reserve-minutes", type=float, default=10.0)
     parser.add_argument("--max-commits-per-run", type=int,
-                        default=int(os.environ.get("MAX_COMMITS_PER_RUN", "12")))
-    parser.add_argument("--min-commit-interval", type=float, default=25.0)
+                        default=int(os.environ.get("MAX_COMMITS_PER_RUN", "500")))
+    parser.add_argument("--min-commit-interval", type=float, default=5.0)
     parser.add_argument("--min-remaining", type=int, default=150)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--self-test", action="store_true")
@@ -1324,7 +1507,11 @@ def main() -> int:
         return 1 if report.get("mismatches") or report.get("refused") else 0
     report = run(args)
     print(json.dumps(report, ensure_ascii=False, indent=1))
-    return 1 if report.get("refused") else 0
+    # Parking until UTC midnight after a quota refusal is a planned stop, so the job is
+    # green; a refusal whose marker could not be written is still a failure.
+    if report.get("refused") and not report.get("parked_until_epoch"):
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
