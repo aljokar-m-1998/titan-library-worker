@@ -123,6 +123,36 @@ def cdn_bytes(path: str) -> bytes | None:
         return None
 
 
+def cdn_fetch(path: str, attempts: int = 4) -> tuple[bytes | None, str]:
+    """A CDN read that says why it failed. cdn_bytes() swallows the status, which made
+    994 refused reads look exactly like 994 absent files."""
+    url = RAW.format(repo=REPO, path=path)
+    last = "no attempt"
+    for attempt in range(1, attempts + 1):
+        if out_of_time():
+            return None, "deadline"
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=UA),
+                                        timeout=120) as response:
+                return response.read(), ""
+        except urllib.error.HTTPError as error:
+            last = f"HTTP {error.code}"
+            if error.code == 404:
+                return None, last
+            if error.code not in (429, 500, 502, 503, 504):
+                return None, last
+            retry = (error.headers or {}).get("Retry-After") or ""
+            delay = min(float(retry), 120) if retry.isdigit() else min(2 ** attempt, 30)
+        except (urllib.error.URLError, OSError, TimeoutError) as error:
+            last = type(error).__name__
+            delay = min(2 ** attempt, 30)
+        if attempt < attempts:
+            if FETCH_DEADLINE:
+                delay = min(delay, max(0.0, FETCH_DEADLINE - time.time()))
+            time.sleep(delay)
+    return None, last
+
+
 # ==============================================================
 #   Commit accounting - vendored from titan-learn-worker
 # ==============================================================
@@ -1077,13 +1107,13 @@ def shelf_check(api, paths: list[str]) -> tuple[int, list[str], dict[str, int]]:
         else:
             sizes[path] = int(getattr(entry, "size", 0) or 0)
     with ThreadPoolExecutor(max_workers=8) as pool:
-        fetched = list(pool.map(lambda p: (p, cdn_bytes(p)), paths))
-    for path, data in fetched:
+        fetched = list(pool.map(lambda p: (p, *cdn_fetch(p)), paths))
+    for path, data, detail in fetched:
         entry = info.get(path)
         if entry is None:
             continue
         if data is None:
-            bad.append(f"{path}: unreadable over the CDN")
+            bad.append(f"{path}: unreadable over the CDN ({detail})")
             continue
         if path.lower().endswith(LFS_SUFFIXES):
             digest = (getattr(getattr(entry, "lfs", None), "sha256", "") or "").lower()
@@ -1911,6 +1941,7 @@ def selftest() -> int:
         ledger_entry = {"key": "gutendex-2821-en", "source": "gutendex", "external_id": 2821,
                         "language": "en"}
         real_cdn = globals()["cdn_bytes"]
+        real_cdn_fetch = globals()["cdn_fetch"]
         real_polite_recovery = globals()["polite_get"]
         cdn_source = [dict(pristine)]
         reads: list[str] = []
@@ -1919,10 +1950,15 @@ def selftest() -> int:
             reads.append(path)
             return cdn_source[0].get(path)
 
+        def fetch_stub(path):
+            data = serve(path)
+            return data, "" if data is not None else "stub: no bytes"
+
         def no_gutenberg(url, **k):
             raise AssertionError(f"recovery must not touch Gutenberg: {url}")
 
         globals()["cdn_bytes"] = serve
+        globals()["cdn_fetch"] = fetch_stub
         globals()["polite_get"] = no_gutenberg
         try:
             check("the shelf enumeration sees both shapes and the bucket/id collision",
@@ -2015,7 +2051,114 @@ def selftest() -> int:
                   < run_src.index("load_catalog("))
         finally:
             globals()["cdn_bytes"] = real_cdn
+            globals()["cdn_fetch"] = real_cdn_fetch
             globals()["polite_get"] = real_polite_recovery
+
+        # A refused CDN read must be retried and must name its status. In run 43944429502,
+        # 994 of 2440 shelf reads returned None and the swallowed status made a refusal
+        # look exactly like an absent file.
+        real_urlopen_cdn = urllib.request.urlopen
+        real_sleep_cdn = time.sleep
+        real_time_cdn = time.time
+        real_deadline_cdn = globals()["FETCH_DEADLINE"]
+        cdn_calls: list[str] = []
+        cdn_sleeps: list[float] = []
+        time.sleep = lambda s: cdn_sleeps.append(s)
+
+        class _CdnResponse:
+            def __init__(self, data):
+                self.data = data
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return self.data
+
+        def refusal(code):
+            return urllib.error.HTTPError("https://cdn/none", code, "refused", {}, None)
+
+        try:
+            globals()["FETCH_DEADLINE"] = 0.0
+
+            def two_refusals_then_bytes(url, timeout=None):
+                cdn_calls.append(str(url))
+                if len(cdn_calls) < 3:
+                    raise refusal(429)
+                return _CdnResponse(b"shelf bytes")
+
+            urllib.request.urlopen = two_refusals_then_bytes
+            data, detail = real_cdn_fetch(f"{orphan_folder}/ch001_en.txt")
+            check("a refused CDN read is retried and then succeeds",
+                  data == b"shelf bytes" and detail == "" and len(cdn_calls) == 3
+                  and cdn_sleeps == [2, 4],
+                  f"calls={len(cdn_calls)} sleeps={cdn_sleeps} detail={detail!r}")
+
+            cdn_calls.clear()
+            cdn_sleeps.clear()
+
+            def always_missing(url, timeout=None):
+                cdn_calls.append(str(url))
+                raise refusal(404)
+
+            urllib.request.urlopen = always_missing
+            data, detail = real_cdn_fetch(f"{orphan_folder}/ch001_en.txt")
+            check("a 404 is named as missing without wasting a retry",
+                  data is None and detail == "HTTP 404" and len(cdn_calls) == 1
+                  and cdn_sleeps == [],
+                  f"calls={len(cdn_calls)} detail={detail!r}")
+
+            cdn_calls.clear()
+            cdn_sleeps.clear()
+
+            def always_refused(url, timeout=None):
+                cdn_calls.append(str(url))
+                raise refusal(429)
+
+            urllib.request.urlopen = always_refused
+            _ok, named_bad, _sizes = shelf_check(_Shelf(simple_tree, dict(pristine)),
+                                                 sorted(pristine))
+            check("the shelf check names the HTTP status of an unreadable file",
+                  len(named_bad) == len(pristine)
+                  and all("unreadable over the CDN (HTTP 429)" in b for b in named_bad),
+                  f"bad={named_bad[:1]}")
+
+            # Retrying must not sleep past the run's deadline: 994 refused reads at a
+            # 120s Retry-After would outlive the job and a timeout cancel flushes nothing.
+            cdn_clock = [2_000_000.0]
+            time.time = lambda: cdn_clock[0]
+            time.sleep = lambda s: (cdn_sleeps.append(s),
+                                    cdn_clock.__setitem__(0, cdn_clock[0] + s))
+            globals()["FETCH_DEADLINE"] = cdn_clock[0] - 1
+            cdn_calls.clear()
+            cdn_sleeps.clear()
+            data, detail = real_cdn_fetch(f"{orphan_folder}/ch001_en.txt")
+            check("a CDN read past the deadline is abandoned without a request",
+                  data is None and detail == "deadline" and cdn_calls == [],
+                  f"detail={detail!r} calls={len(cdn_calls)}")
+
+            def slow_refusal(url, timeout=None):
+                cdn_calls.append(str(url))
+                raise urllib.error.HTTPError("https://cdn/none", 429, "slow down",
+                                             {"Retry-After": "300"}, None)
+
+            urllib.request.urlopen = slow_refusal
+            globals()["FETCH_DEADLINE"] = cdn_clock[0] + 10
+            cdn_calls.clear()
+            cdn_sleeps.clear()
+            data, detail = real_cdn_fetch(f"{orphan_folder}/ch001_en.txt")
+            check("a CDN Retry-After is clamped to the time left, then the read aborts",
+                  data is None and detail == "deadline" and cdn_sleeps == [10.0]
+                  and len(cdn_calls) == 1,
+                  f"detail={detail!r} sleeps={cdn_sleeps} calls={len(cdn_calls)}")
+        finally:
+            urllib.request.urlopen = real_urlopen_cdn
+            time.sleep = real_sleep_cdn
+            time.time = real_time_cdn
+            globals()["FETCH_DEADLINE"] = real_deadline_cdn
 
         sleeps: list[float] = []
         time.sleep = lambda s: sleeps.append(s)

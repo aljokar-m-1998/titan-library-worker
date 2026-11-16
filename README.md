@@ -184,7 +184,7 @@ text and `lfs.sha256` + size for images, and falls back to re-fetching CDN bytes
 a Xet-backed object exposes no LFS oid. `--verify-last` re-reads the checkpoint and
 verifies independently of the run that wrote it.
 
-`--self-test` is a network-free positive control: **61 assertions**. A synthetic
+`--self-test` is a network-free positive control: **66 assertions**. A synthetic
 Gutenberg fixture with a contents listing, a dedication and three real chapters must
 yield exactly three chapters with the right titles, plus known-answer vectors for the
 git blob sha1, the path guard and the strict `en` / `Text` filter. A stub api and a
@@ -217,6 +217,19 @@ CDN bytes pass `shelf_check` while bytes that differ from the recorded blob id a
 flagged; a refused recovery commit rolls the index and the ledger back; and three
 source-order guards prove `run()` calls `recover_orphans`, wires both helpers, and arms
 `FETCH_DEADLINE` **before** `load_catalog`.
+
+Three more pin the CDN read itself. `cdn_fetch()` retries a 429 / 500 / 502 / 503 / 504
+with capped backoff and returns the reason beside the bytes, a 404 is named as missing
+without spending a retry, and `shelf_check()` prints that reason. Measured on 2026-11-16
+in run 43944429502: **994 of 2,440** shelf files came back `unreadable over the CDN` and
+recovery aborted without committing. `cdn_bytes()` swallowed the HTTP status, so a
+refusal and an absent file were the same `None`; the status is now in the log line
+instead of being inferred.
+
+Two more keep that retry inside the shared clock: a read started past `FETCH_DEADLINE`
+returns `deadline` having made **zero** requests, and a `Retry-After: 300` ten seconds
+before the deadline sleeps exactly **10s**. Without the clamp, 994 refused reads at 120s
+each would outlive the 340-minute job, and a timeout cancel flushes nothing.
 
 Hash equality proves the hub stores what the runner wrote, not that a reader can fetch
 it. The `audit the public shelf without a token` step closes that layer: it pulls
