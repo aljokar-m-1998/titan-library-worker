@@ -2,8 +2,9 @@ name: ingest Gutenberg texts into Titan-Library
 
 # Every byte is fetched, cleaned, packaged and committed on GitHub's runner.
 # Text + metadata + covers only; the EAD client narrates on device.
-# One job, one writer: the gateway's library worker is off (see tts-switch.yml),
-# so nothing else touches ledger.json or _worker/ while this runs.
+# One writer of ledger.json and _worker/: the gateway's shelf worker is off (see
+# tts-switch.yml). Its Arabic translation worker still writes cast mp3 + words.json into
+# the legacy flat book folders, but never into the ledger or the worker state.
 
 on:
   workflow_dispatch:
