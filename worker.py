@@ -14,6 +14,7 @@ import argparse
 import csv
 import gzip
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -65,6 +66,14 @@ MAX_ATTEMPTS = 5
 DIR_ENTRY_LIMIT = 10_000
 
 STATE_HOOK: dict = {}
+
+# One clock for the whole run: a fetch that cannot finish before the deadline is
+# abandoned instead of retrying past it, so a throttled source cannot eat the budget.
+FETCH_DEADLINE = 0.0
+
+
+def out_of_time() -> bool:
+    return bool(FETCH_DEADLINE) and time.time() >= FETCH_DEADLINE
 
 
 def log(message: str) -> None:
@@ -544,6 +553,8 @@ def polite_get(url: str, *, limit: int, interval: float, kind: str) -> dict:
         return {"status": "rejected", "error": "host outside Project Gutenberg"}
     last = "no attempt"
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        if out_of_time():
+            return {"status": "deadline", "error": "run deadline reached"}
         delay = min(2 ** attempt, 60)
         wait = interval - (time.monotonic() - _LAST_FETCH)
         if wait > 0:
@@ -577,6 +588,8 @@ def polite_get(url: str, *, limit: int, interval: float, kind: str) -> dict:
                 delay = min(float(retry), 300)
         except (urllib.error.URLError, OSError, TimeoutError) as error:
             last = f"{type(error).__name__}: {error}"
+        if FETCH_DEADLINE:
+            delay = min(delay, max(0.0, FETCH_DEADLINE - time.time()))
         log(f"{kind} {url} attempt {attempt}/{MAX_ATTEMPTS}: {last} - sleep {delay:.0f}s")
         time.sleep(delay)
     return {"status": "failed", "error": last}
@@ -765,6 +778,8 @@ def build_book(row: dict, *, interval: float) -> dict:
         if got["status"] == "ok":
             text = got
             break
+        if got["status"] == "deadline":
+            return {"id": gid, "status": "deadline", "error": got["error"]}
         if got["status"] != "missing":
             return {"id": gid, "status": "failed", "error": got["error"]}
     if text is None:
@@ -787,6 +802,8 @@ def build_book(row: dict, *, interval: float) -> dict:
 
     cover = polite_get(f"https://www.gutenberg.org/cache/epub/{gid}/pg{gid}.cover.medium.jpg",
                        limit=MAX_COVER_BYTES, interval=interval, kind="cover")
+    if cover["status"] == "deadline":
+        return {"id": gid, "status": "deadline", "error": cover["error"]}
     cover_data = (cover["data"] if cover["status"] == "ok"
                   and cover["data"][:3] == b"\xff\xd8\xff" else None)
 
@@ -1032,6 +1049,7 @@ def verify_last(api) -> dict:
 #   The run
 # ==============================================================
 def run(args) -> dict:
+    global FETCH_DEADLINE
     api = hf_api()
     until = backoff_until(api)
     if until and time.time() < until:
@@ -1083,6 +1101,7 @@ def run(args) -> dict:
                        "expected": carried})
     started = time.time()
     budget.deadline = started + (args.max_minutes - args.reserve_minutes) * 60
+    FETCH_DEADLINE = budget.deadline
     history: list[dict] = []
     cursor = 0
     carry: dict | None = None
@@ -1098,16 +1117,21 @@ def run(args) -> dict:
                             "last_batch_minutes": round(last_batch_seconds / 60, 1)})
             break
         batch_start = time.time()
+        batch_deadline = batch_start + args.batch_minutes * 60
         built: list[dict] = []
         files: dict[str, bytes] = {}
         failures: list[dict] = []
         while len(built) < args.batch_size and (carry is not None or cursor < len(queue)):
+            if out_of_time() or time.time() >= batch_deadline:
+                break
             if carry is not None:
                 item, carry = carry, None
             else:
                 row = queue[cursor]
                 cursor += 1
                 item = build_book(row, interval=args.fetch_interval)
+            if item["status"] == "deadline":
+                break
             if item["status"] != "built":
                 gid = str(item["id"])
                 previous = index["books"].get(gid, {})
@@ -1128,7 +1152,10 @@ def run(args) -> dict:
             files.update(item["files"])
         if not built:
             history.append({"batch": batch_number, "drained": cursor >= len(queue) and carry is None,
-                            "books_fetched": 0, "failures": failures[:10]})
+                            "books_fetched": 0, "failures": failures[:10],
+                            "stopped_because_batch": "run deadline" if out_of_time()
+                            else ("batch-minutes cap" if time.time() >= batch_deadline
+                                  else "queue drained")})
             break
 
         block = budget.allow()
@@ -1215,7 +1242,8 @@ def run(args) -> dict:
                         "commits_last_24h": budget.commits_last_24h(),
                         "rate_remaining": budget.state.get("remaining"),
                         "queue_remaining": len(queue) - cursor,
-                        "minutes": round(last_batch_seconds / 60, 1)})
+                        "minutes": round(last_batch_seconds / 60, 1),
+                        "cut_short": out_of_time() or time.time() >= batch_deadline})
         log(f"batch {batch_number}: {len(built)} books, {verified} files verified, "
             f"{len(bad)} mismatches, {len(queue) - cursor} left in queue")
         if bad:
@@ -1239,6 +1267,7 @@ def run(args) -> dict:
             "by_status": dict(Counter(r.get("status", "?") for r in index["books"].values())),
             "candidates": len(candidates), "queue_scanned": len(queue),
             "batches": history, "refused": refused, "parked_until_epoch": parked_until,
+            "deadline_utc": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(FETCH_DEADLINE)),
             "commit_budget": budget.report(),
             "minutes": round((time.time() - started) / 60, 1)}
 
@@ -1478,6 +1507,104 @@ def selftest() -> int:
         check("an index with no stale rows costs no lookup",
               heal_stale_rows(fake, {"books": {"1": {"status": "verified_remote"}}}) == (0, 0))
 
+        # A throttled source must not eat the run: one shared clock aborts fetches and cuts
+        # batches, and a deadline abort never becomes a failed attempt in the index.
+        real_urlopen = urllib.request.urlopen
+        real_polite = globals()["polite_get"]
+        real_deadline = globals()["FETCH_DEADLINE"]
+        clock = [1_000_000.0]
+        calls: list[str] = []
+        fetch_sleeps: list[float] = []
+
+        class _Resp:
+            def __init__(self, data):
+                self._data = data
+                self.headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def geturl(self):
+                return "https://www.gutenberg.org/cache/epub/1/pg1.txt.utf8"
+
+            def read(self, n=-1):
+                return self._data
+
+        def fake_urlopen(req, timeout=None):
+            calls.append(req.full_url)
+            return _Resp(b"hello body")
+
+        def refuse_urlopen(req, timeout=None):
+            calls.append(req.full_url)
+            raise urllib.error.HTTPError(req.full_url, 429, "slow down",
+                                         {"Retry-After": "300"}, None)
+
+        time.time = lambda: clock[0]
+        time.sleep = lambda s: (fetch_sleeps.append(s), clock.__setitem__(0, clock[0] + s))
+        urllib.request.urlopen = fake_urlopen
+        try:
+            states = []
+            for value in (0.0, clock[0] - 1, clock[0] + 5):
+                globals()["FETCH_DEADLINE"] = value
+                states.append(out_of_time())
+            check("the shared clock reads unset, past and future",
+                  states == [False, True, False], f"states={states}")
+            globals()["FETCH_DEADLINE"] = clock[0] - 1
+            calls.clear()
+            got = real_polite("https://www.gutenberg.org/cache/epub/1/pg1.txt.utf8",
+                              limit=1000, interval=0.0, kind="text")
+            check("a fetch past the deadline is abandoned without a request",
+                  got["status"] == "deadline" and calls == [],
+                  f"status={got['status']} calls={len(calls)}")
+            globals()["FETCH_DEADLINE"] = 0.0
+            calls.clear()
+            got = real_polite("https://www.gutenberg.org/cache/epub/1/pg1.txt.utf8",
+                              limit=1000, interval=0.0, kind="text")
+            check("positive control: the same stub fetches when no deadline is armed",
+                  got["status"] == "ok" and len(calls) == 1,
+                  f"status={got['status']} calls={len(calls)}")
+            urllib.request.urlopen = refuse_urlopen
+            clock[0] = 2_000_000.0
+            globals()["FETCH_DEADLINE"] = clock[0] + 10
+            fetch_sleeps.clear()
+            calls.clear()
+            got = real_polite("https://www.gutenberg.org/cache/epub/1/pg1.txt.utf8",
+                              limit=1000, interval=0.0, kind="text")
+            check("a 300s Retry-After is clamped to the time left, then the fetch aborts",
+                  got["status"] == "deadline" and fetch_sleeps == [10.0] and len(calls) == 1,
+                  f"status={got['status']} sleeps={fetch_sleeps} calls={len(calls)}")
+            globals()["polite_get"] = lambda url, **k: {
+                "status": "deadline", "error": "run deadline reached"}
+            item = build_book({"id": 1, "title": "t"}, interval=0.0)
+            check("build_book propagates a text deadline instead of a failed attempt",
+                  item["status"] == "deadline", f"status={item['status']}")
+
+            def text_then_cover(url, **k):
+                if k.get("kind") == "cover":
+                    return {"status": "deadline", "error": "run deadline reached"}
+                return {"status": "ok", "data": FIXTURE.encode(), "url": url,
+                        "bytes": len(FIXTURE), "sha256": "x"}
+
+            globals()["polite_get"] = text_then_cover
+            item = build_book({"id": 1, "title": "t"}, interval=0.0)
+            check("build_book propagates a cover deadline instead of shipping coverless",
+                  item["status"] == "deadline", f"status={item['status']}")
+            run_src = inspect.getsource(run)
+            check("run() arms the shared clock and the batch loop consults it",
+                  {"FETCH_DEADLINE", "out_of_time"} <= set(run.__code__.co_names)
+                  and "FETCH_DEADLINE = budget.deadline" in run_src
+                  and "if out_of_time() or time.time() >= batch_deadline:" in run_src)
+            check("the batch loop compares against the deadline status, not failed",
+                  "deadline" in run.__code__.co_consts)
+        finally:
+            urllib.request.urlopen = real_urlopen
+            globals()["polite_get"] = real_polite
+            globals()["FETCH_DEADLINE"] = real_deadline
+            time.time, time.sleep = real_time, real_sleep
+
         sleeps: list[float] = []
         time.sleep = lambda s: sleeps.append(s)
         windows = iter([{"RateLimit": '"api";r=12;t=7', "RateLimit-Policy": '"api";q=1000;w=300'},
@@ -1531,6 +1658,7 @@ def main() -> int:
     parser.add_argument("--scan", type=int, default=0)
     parser.add_argument("--fetch-interval", type=float, default=0.3)
     parser.add_argument("--max-minutes", type=float, default=320.0)
+    parser.add_argument("--batch-minutes", type=float, default=12.0)
     parser.add_argument("--reserve-minutes", type=float, default=10.0)
     parser.add_argument("--max-commits-per-run", type=int,
                         default=int(os.environ.get("MAX_COMMITS_PER_RUN", "500")))

@@ -3,9 +3,21 @@
 Cloud-only ingestion of Project Gutenberg into the Hugging Face dataset
 [`M-hv1/Titan-Library`](https://huggingface.co/datasets/M-hv1/Titan-Library).
 
-**Text, metadata and covers only.** No audio is synthesized, uploaded or indexed.
-The American English Daily client narrates on device, so server-side TTS for this
-dataset is retired (see `tts-switch.yml`).
+**This worker writes text, metadata and covers only.** It synthesizes, uploads and
+indexes no audio. The American English Daily client narrates on device, so
+server-side TTS for this dataset is retired (see `tts-switch.yml`).
+
+The dataset itself is not audio-free, and this repository is not its only writer.
+Measured on 2026-11-16: the gateway's Arabic translation worker still writes English
+cast `mp3` + `words.json` into the legacy flat folders `books/gutendex/{id}/en/`
+(`api/titan_translate.py:3453`, `en_q.flush(...)`). `LIBRARY_WORKER=0` gates the
+gateway's *shelf* worker (`api/titan_library.py:1201`), not that one; the whole Arabic
+worker is gated by `ARABIC_WORKER=0`, and setting it is the owner's decision. The two
+writers cannot corrupt each other's state: `_Queue.flush` rewrites `ledger.json` only
+when an op path equals `LEDGER_PATH`, and the cast queue holds cast files only, so
+`ledger.json` and `_worker/*` stay this worker's alone. The sharded buckets
+`books/gutendex/{0..4}/` hold **zero** mp3 — 3,813 book folders, 86,729 chapters,
+1.55 GiB of text, covers and json.
 
 Every byte of fetching, cleaning, packaging and committing happens on a GitHub
 Actions runner. Nothing is downloaded to a laptop.
@@ -65,6 +77,24 @@ There is no assumed daily ceiling; the hub's own answer decides.
   only gives up on a low window when the sleep would cross the run's deadline
   (`max_minutes - reserve_minutes`).
 - A batch only starts if `elapsed + last_batch_seconds + reserve_minutes <= max_minutes`.
+- A batch also stops **inside** its build loop. `--batch-minutes` (default 12) caps one
+  batch's fetching, and one shared clock (`FETCH_DEADLINE = max_minutes - reserve_minutes`)
+  caps every fetch: `polite_get` returns `status="deadline"` rather than retrying past
+  it and clamps its backoff sleep to the time left, `build_book` propagates that status
+  for both the text and the cover, and the batch ships what it already has.
+  `batches[-1].cut_short` and `stopped_because_batch` say which guard fired.
+
+### Why the in-batch guard exists
+
+Measured on 2026-11-16: `www.gutenberg.org/cache/epub/` answered **HTTP 503 with
+`Retry-After: 300`** for twelve consecutive books (4171–4182) from 13:16:28Z to
+18:11:49Z — five attempts × 300s per URL, ~25 minutes per book. The deadline was only
+checked between batches, so the run committed nothing for five hours and GitHub
+cancelled it at the 340-minute timeout (18:15:18Z). A timeout cancel flushes nothing:
+the checkpoint stayed at `13:14:05Z` and the orphan python process was terminated.
+The public shelf audit in that same cancelled run still passed every check
+(3,776 ledger entries = 3,776 catalog rows, `problems: []`), so the stall cost time,
+not data.
 
 ### Smart backoff
 
@@ -112,7 +142,7 @@ text and `lfs.sha256` + size for images, and falls back to re-fetching CDN bytes
 a Xet-backed object exposes no LFS oid. `--verify-last` re-reads the checkpoint and
 verifies independently of the run that wrote it.
 
-`--self-test` is a network-free positive control: **41 assertions**. A synthetic
+`--self-test` is a network-free positive control: **49 assertions**. A synthetic
 Gutenberg fixture with a contents listing, a dedication and three real chapters must
 yield exactly three chapters with the right titles, plus known-answer vectors for the
 git blob sha1, the path guard and the strict `en` / `Text` filter. A stub api and a
@@ -124,6 +154,15 @@ for an unmarked refusal. Three more checks pin the state bookkeeping: a refusal 
 first batch must leave the previous run's `last_commit` expectations intact, a stale
 `uploaded_unverified` row whose files are on the shelf gets settled and one whose files
 are *not* stays untouched, and `run()` must actually call both helpers.
+
+Eight more pin the deadline contract, on a frozen clock with a counted `urlopen` stub:
+`out_of_time()` is false before the deadline and true after it; a fetch started past
+the deadline returns `deadline` having made **zero** requests; the positive control
+(`FETCH_DEADLINE = 0`) still fetches and returns `ok`; a 429/503 with `Retry-After: 300`
+ten seconds before the deadline sleeps exactly **10s**, not 300s, and then returns
+`deadline`; `build_book` propagates a deadlined text fetch and a deadlined cover fetch;
+and `run()` must reference both `FETCH_DEADLINE` and `out_of_time` and carry the
+`deadline` status in its own constants.
 
 Hash equality proves the hub stores what the runner wrote, not that a reader can fetch
 it. The `audit the public shelf without a token` step closes that layer: it pulls
@@ -172,10 +211,12 @@ gh workflow run tts-switch.yml -f state=on          # restore it
 ```
 
 The cron (`17 */4 * * *`) uses `batch_size=100`, `timeout-minutes: 340`,
-`--max-minutes 320` and `--reserve-minutes 10`. A run that uses its full window queues
-the next one through `concurrency: titan-library-ingest` (`cancel-in-progress: false`),
-so the effective cadence is about 5h20m rather than 4h. Set the repository variable
-`INGEST_DRY_RUN=true` to make scheduled runs commit nothing.
+`--max-minutes 320`, `--reserve-minutes 10` and `--batch-minutes 12`. A run that uses
+its full window queues the next one through `concurrency: titan-library-ingest`
+(`cancel-in-progress: false`), so the effective cadence is about 5h20m rather than 4h.
+Set the repository variable `INGEST_DRY_RUN=true` to make scheduled runs commit nothing.
+A `workflow_dispatch` run freezes the commit it was created from, so a fix pushed while
+a run is alive only takes effect on the **next** dispatch.
 
 Measured on 2026-11-16 at these settings: **2.5 minutes per commit and 36 books per
 minute** (25 commits, 2,259 books, 58,781 files, 948 MB in 62.6 minutes, zero hash

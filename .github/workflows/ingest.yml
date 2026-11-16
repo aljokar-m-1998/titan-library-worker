@@ -32,6 +32,10 @@ on:
         description: "wall-clock limit for the ingest step"
         required: false
         default: "320"
+      batch_minutes:
+        description: "max minutes one batch may spend fetching before it ships what it has"
+        required: false
+        default: "12"
       dry_run:
         description: "fetch and clean 3 books, commit nothing"
         required: false
@@ -99,6 +103,7 @@ jobs:
             --max-commits-per-run "${{ github.event.inputs.max_commits_per_run || vars.MAX_COMMITS_PER_RUN || '500' }}" \
             --fetch-interval "${{ github.event.inputs.fetch_interval || '0.3' }}" \
             --max-minutes "${{ github.event.inputs.max_minutes || '320' }}" \
+            --batch-minutes "${{ github.event.inputs.batch_minutes || '12' }}" \
             --reserve-minutes 10 --min-commit-interval 5 --min-remaining 150 \
             ${{ (github.event.inputs.dry_run == 'true' || (github.event_name == 'schedule' && vars.INGEST_DRY_RUN == 'true')) && '--dry-run' || '' }} \
             > ingest-run.json
