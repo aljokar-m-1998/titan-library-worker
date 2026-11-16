@@ -104,6 +104,18 @@ The same day the **catalog feed itself** answered 503
 clock used to be armed *after* the catalog fetch. Arming it right after the
 `reserve_minutes` guard closes that gap: the feed now obeys the same deadline as a book.
 
+Measured again at 22:35Z from a runner (`probe-aleph.yml`, 256 bytes per URL): the feed
+answered **HTTP 503 with `Retry-After: 3600`** — an hour, not the five minutes the cap
+used to allow. `polite_get` now honors the source's own `Retry-After` up to **3600s**,
+still clamped to the time left before `FETCH_DEADLINE`, so a run waits the hour it was
+asked for instead of knocking five times in 25 minutes. The same probe found
+`aleph.gutenberg.org` unusable over HTTPS (`CERTIFICATE_VERIFY_FAILED … Hostname
+mismatch, certificate is not valid for 'aleph.gutenberg.org'`) while `www.gutenberg.org`
+answered with a real HTTP status from the same runner — so the mirror's failure is its
+certificate, not the runner's network. The probe also reads the mirror over plain HTTP
+to separate a broken certificate from a dead host; it writes nothing and changes no
+fetch path.
+
 ### Smart backoff
 
 Only a refused `create_commit` parks the pipeline. On a 429 / rate-limit / quota /
@@ -184,7 +196,7 @@ text and `lfs.sha256` + size for images, and falls back to re-fetching CDN bytes
 a Xet-backed object exposes no LFS oid. `--verify-last` re-reads the checkpoint and
 verifies independently of the run that wrote it.
 
-`--self-test` is a network-free positive control: **66 assertions**. A synthetic
+`--self-test` is a network-free positive control: **68 assertions**. A synthetic
 Gutenberg fixture with a contents listing, a dedication and three real chapters must
 yield exactly three chapters with the right titles, plus known-answer vectors for the
 git blob sha1, the path guard and the strict `en` / `Text` filter. A stub api and a
@@ -197,14 +209,15 @@ first batch must leave the previous run's `last_commit` expectations intact, a s
 `uploaded_unverified` row whose files are on the shelf gets settled and one whose files
 are *not* stays untouched, and `run()` must actually call both helpers.
 
-Eight more pin the deadline contract, on a frozen clock with a counted `urlopen` stub:
+Ten more pin the deadline contract, on a frozen clock with a counted `urlopen` stub:
 `out_of_time()` is false before the deadline and true after it; a fetch started past
 the deadline returns `deadline` having made **zero** requests; the positive control
 (`FETCH_DEADLINE = 0`) still fetches and returns `ok`; a 429/503 with `Retry-After: 300`
 ten seconds before the deadline sleeps exactly **10s**, not 300s, and then returns
-`deadline`; `build_book` propagates a deadlined text fetch and a deadlined cover fetch;
-and `run()` must reference both `FETCH_DEADLINE` and `out_of_time` and carry the
-`deadline` status in its own constants.
+`deadline`; a `Retry-After: 3600` with time to spare sleeps the full **3600s** on every
+attempt, and a `Retry-After: 7200` is capped at **3600s**; `build_book` propagates a
+deadlined text fetch and a deadlined cover fetch; and `run()` must reference both
+`FETCH_DEADLINE` and `out_of_time` and carry the `deadline` status in its own constants.
 
 Eleven more pin orphan recovery and the clock's position, on a stub shelf (a fake tree,
 a fake `get_paths_info` and a CDN stub) with `polite_get` replaced by a function that

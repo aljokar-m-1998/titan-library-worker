@@ -616,7 +616,7 @@ def polite_get(url: str, *, limit: int, interval: float, kind: str) -> dict:
                 return {"status": "failed", "error": last}
             retry = (error.headers or {}).get("Retry-After") or ""
             if retry.isdigit():
-                delay = min(float(retry), 300)
+                delay = min(float(retry), 3600)
         except (urllib.error.URLError, OSError, TimeoutError) as error:
             last = f"{type(error).__name__}: {error}"
         if FETCH_DEADLINE:
@@ -1826,6 +1826,34 @@ def selftest() -> int:
             check("a 300s Retry-After is clamped to the time left, then the fetch aborts",
                   got["status"] == "deadline" and fetch_sleeps == [10.0] and len(calls) == 1,
                   f"status={got['status']} sleeps={fetch_sleeps} calls={len(calls)}")
+
+            # The source itself asked for 3600s on 2026-11-16; cutting that to 300 meant
+            # five refusals in 25 minutes instead of one polite wait.
+            def retry_after(value):
+                def stub(req, timeout=None):
+                    calls.append(req.full_url)
+                    raise urllib.error.HTTPError(req.full_url, 503, "unavailable",
+                                                 {"Retry-After": str(value)}, None)
+                return stub
+
+            feed = "https://www.gutenberg.org/cache/epub/feeds/pg_catalog.csv.gz"
+            clock[0] = 3_000_000.0
+            globals()["FETCH_DEADLINE"] = clock[0] + 100_000
+            urllib.request.urlopen = retry_after(3600)
+            fetch_sleeps.clear()
+            calls.clear()
+            got = real_polite(feed, limit=1000, interval=0.0, kind="catalog")
+            check("a one-hour Retry-After is honored, not cut to five minutes",
+                  got["status"] == "failed" and len(calls) == MAX_ATTEMPTS
+                  and fetch_sleeps == [3600.0] * MAX_ATTEMPTS,
+                  f"sleeps={fetch_sleeps[:2]} calls={len(calls)}")
+            urllib.request.urlopen = retry_after(7200)
+            fetch_sleeps.clear()
+            calls.clear()
+            got = real_polite(feed, limit=1000, interval=0.0, kind="catalog")
+            check("a Retry-After beyond an hour is capped at one hour",
+                  fetch_sleeps == [3600.0] * MAX_ATTEMPTS,
+                  f"sleeps={fetch_sleeps[:2]}")
             globals()["polite_get"] = lambda url, **k: {
                 "status": "deadline", "error": "run deadline reached"}
             item = build_book({"id": 1, "title": "t"}, interval=0.0)
