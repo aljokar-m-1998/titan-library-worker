@@ -1,0 +1,209 @@
+name: keep the shelf pumping
+
+# GitHub documents scheduled workflows as best-effort. On 2026-11-16 three eligible
+# ingest windows passed with zero `schedule` run records and zero progress on the
+# dataset, with nothing in our configuration explaining it. This heartbeat asks one
+# question an hour - has the shelf taken a commit lately, is a writer alive, is the
+# worker parked? - and dispatches one ingest run when the shelf, not the clock, says so.
+# It never fetches a book and never writes to the dataset itself.
+
+on:
+  workflow_dispatch:
+    inputs:
+      stale_minutes:
+        description: "how long without a dataset commit counts as stalled"
+        required: false
+        default: "180"
+      batch_size:
+        description: "books per commit to hand the dispatched ingest run"
+        required: false
+        default: "100"
+      state_only:
+        description: "decide and report, dispatch nothing"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+  schedule:
+    # :27 so a heartbeat never shares a minute with the ingest cron at :17
+    - cron: "27 * * * *"
+
+concurrency:
+  group: titan-library-heartbeat
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      HF_DATASET: M-hv1/Titan-Library
+      GH_REPO: ${{ github.repository }}
+      DISPATCH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+      STALE_MINUTES: ${{ github.event.inputs.stale_minutes || '180' }}
+      BATCH_SIZE: ${{ github.event.inputs.batch_size || '100' }}
+      STATE_ONLY: ${{ github.event.inputs.state_only || 'false' }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: decide from the dataset and the run queue
+        run: |
+          set +e
+          python - <<'PY' > heartbeat.json
+          import calendar, json, os, sys, time, urllib.error, urllib.request
+
+          UA = {"User-Agent": "TitanLibrary-Heartbeat/1.0 "
+                              "(+https://github.com/aljokar-m-1998/titan-library-worker)",
+                "Accept": "application/vnd.github+json"}
+          DATASET = os.environ["HF_DATASET"]
+          REPO = os.environ["GH_REPO"]
+          TOKEN = os.environ.get("DISPATCH_TOKEN", "")
+          STALE_AFTER = int(os.environ["STALE_MINUTES"]) * 60
+          STATE_ONLY = os.environ["STATE_ONLY"] == "true"
+          RUNS_URL = (f"https://api.github.com/repos/{REPO}"
+                      f"/actions/workflows/ingest.yml/runs?per_page=10")
+          now = int(time.time())
+          checks: list[dict] = []
+          problems: list[str] = []
+
+          def note(ok: bool, label: str, detail: str = "") -> None:
+              checks.append({"ok": ok, "label": label, "detail": detail})
+              print(("PASS " if ok else "FAIL ") + label + (f" {detail}" if detail else ""),
+                    file=sys.stderr, flush=True)
+
+          def call(url: str, auth: bool = False, body: dict | None = None):
+              headers = dict(UA)
+              if auth:
+                  headers["Authorization"] = "Bearer " + TOKEN
+              data = None
+              if body is not None:
+                  data = json.dumps(body).encode()
+                  headers["Content-Type"] = "application/json"
+              try:
+                  with urllib.request.urlopen(
+                          urllib.request.Request(url, headers=headers, data=data),
+                          timeout=60) as response:
+                      raw = response.read()
+                  return response.status, (json.loads(raw) if raw else {})
+              except urllib.error.HTTPError as error:
+                  raw = error.read()
+                  try:
+                      payload = json.loads(raw) if raw else {}
+                  except json.JSONDecodeError:
+                      payload = {"body": str(raw)[:200]}
+                  return error.code, payload
+              except Exception as error:
+                  return 0, {"error": f"{type(error).__name__}: {str(error)[:160]}"}
+
+          # 1 - a deliberate park until the next UTC day outranks every other signal
+          status, marker = call(f"https://huggingface.co/datasets/{DATASET}"
+                                f"/resolve/main/_worker/backoff.json")
+          parked_until = 0
+          if status == 404:
+              note(True, "no backoff marker on the shelf")
+          elif status == 200:
+              parked_until = int(marker.get("not_before_epoch") or 0)
+              note(True, "backoff marker read",
+                   "not_before=" + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(parked_until)))
+          else:
+              note(False, "backoff lookup", f"HTTP {status} {str(marker)[:160]}")
+              problems.append(f"backoff lookup HTTP {status}")
+
+          # 2 - never stack a dispatch on a live writer
+          status, runs = call(RUNS_URL, auth=True)
+          if status != 200:
+              note(False, "run lookup", f"HTTP {status} {str(runs)[:160]}")
+              problems.append(f"run lookup HTTP {status}")
+              records = []
+          else:
+              records = runs.get("workflow_runs") or []
+          alive = [r for r in records if r.get("status") != "completed"]
+          newest_id = max([int(r.get("id") or 0) for r in records] or [0])
+          note(True, "run queue read", f"alive={len(alive)} newest_run={newest_id}")
+
+          # 3 - freshness comes from the dataset, and the hub's date is UTC: calendar.timegm,
+          #     never time.mktime, which would silently use the runner's local zone
+          status, commits = call(f"https://huggingface.co/api/datasets/{DATASET}"
+                                 f"/commits/main?limit=1")
+          age = None
+          last_commit = ""
+          if status == 200 and commits:
+              last_commit = (commits[0].get("id") or "")[:12]
+              parsed = time.strptime(commits[0]["date"][:19], "%Y-%m-%dT%H:%M:%S")
+              age = now - calendar.timegm(parsed)
+              note(True, "newest dataset commit", f"{last_commit} age={age // 60}m")
+          else:
+              note(False, "dataset commit lookup", f"HTTP {status} {str(commits)[:160]}")
+              problems.append(f"dataset commit lookup HTTP {status}")
+
+          if parked_until and now < parked_until:
+              decision = "parked"
+          elif alive:
+              decision = "run-alive"
+          elif age is not None and age < STALE_AFTER:
+              decision = "fresh"
+          else:
+              decision = "dispatch"
+
+          dispatched = None
+          if decision != "dispatch":
+              note(True, f"nothing to do ({decision})")
+          elif STATE_ONLY:
+              note(True, "state_only: would dispatch, dispatching nothing")
+          elif not TOKEN:
+              note(False, "dispatch token present", "GH_DISPATCH_TOKEN is not set")
+              problems.append("GH_DISPATCH_TOKEN is not set, so no dispatch is possible")
+          else:
+              status, body = call(
+                  f"https://api.github.com/repos/{REPO}"
+                  f"/actions/workflows/ingest.yml/dispatches",
+                  auth=True,
+                  body={"ref": "main", "inputs": {"batch_size": os.environ["BATCH_SIZE"]}})
+              note(status == 204, "dispatch accepted", f"HTTP {status} {str(body)[:120]}")
+              if status != 204:
+                  problems.append(f"dispatch HTTP {status}: {str(body)[:200]}")
+              else:
+                  # GITHUB_TOKEN answers 204 and creates NOTHING at all: prove the record.
+                  for _ in range(12):
+                      time.sleep(5)
+                      _s, fresh = call(RUNS_URL, auth=True)
+                      ids = [int(r.get("id") or 0)
+                             for r in ((fresh.get("workflow_runs") or []) if _s == 200 else [])]
+                      if [i for i in ids if i > newest_id]:
+                          dispatched = max(i for i in ids if i > newest_id)
+                          break
+                  note(dispatched is not None, "a run record actually appeared",
+                       f"run={dispatched}")
+                  if dispatched is None:
+                      problems.append("dispatch accepted but created no run record: "
+                                      "GITHUB_TOKEN cannot trigger workflows, the secret "
+                                      "must be a PAT with Actions: read and write")
+
+          print(json.dumps({"now_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+                            "decision": decision, "parked_until_epoch": parked_until,
+                            "alive_runs": len(alive), "newest_dataset_commit": last_commit,
+                            "commit_age_minutes": None if age is None else age // 60,
+                            "stale_minutes": STALE_AFTER // 60, "state_only": STATE_ONLY,
+                            "dispatched_run": dispatched, "checks": checks,
+                            "problems": problems}, ensure_ascii=False, indent=1))
+          raise SystemExit(1 if problems else 0)
+          PY
+          status=$?
+          set -e
+          cat heartbeat.json
+          exit $status
+
+      - name: upload the verdict
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: heartbeat-${{ github.run_number }}
+          path: heartbeat.json
+          if-no-files-found: error

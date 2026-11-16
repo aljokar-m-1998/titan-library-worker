@@ -108,7 +108,7 @@ jobs:
           exit $status
 
       - name: independent remote verification of the last commit
-        if: ${{ github.event.inputs.dry_run != 'true' }}
+        if: ${{ always() && github.event.inputs.dry_run != 'true' }}
         run: |
           set +e
           python worker.py --verify-last > verify-run.json

@@ -294,6 +294,21 @@ def prime_last_commit(api, budget: Budget) -> dict:
     return expected
 
 
+def heal_stale_rows(api, index: dict) -> tuple[int, int]:
+    """The last batch of every run is written into the index as uploaded_unverified:
+    the correction only ever ships in the *next* commit, and the next run never re-checks
+    books it did not build. Look those rows up on the shelf once and settle the ledger."""
+    stale = [int(k) for k, row in index["books"].items()
+             if row.get("status") == "uploaded_unverified"]
+    if not stale:
+        return 0, 0
+    on_shelf = existing_books(api, stale)
+    for gid in on_shelf:
+        index["books"][str(gid)]["status"] = "verified_remote"
+        index["books"][str(gid)]["verified_at"] = stamp()
+    return len(on_shelf), len(stale) - len(on_shelf)
+
+
 def save_backoff(api, budget: Budget) -> int:
     """A refused commit parks the pipeline until the next UTC midnight. Writing this
     marker is the one last request; nothing else is sent until the new day starts."""
@@ -1032,6 +1047,10 @@ def run(args) -> dict:
     index = load_state(api)
     ledger = load_ledger(api)
     legacy = backfill_legacy(api, index, ledger)
+    healed, still_stale = heal_stale_rows(api, index)
+    if healed or still_stale:
+        log(f"index self-heal: {healed} stale rows re-verified from the shelf, "
+            f"{still_stale} still unverified")
     catalog, stats = load_catalog(args.fetch_interval)
     known = {int(k) for k, v in index["books"].items() if v.get("status") == "verified_remote"}
     known |= ledger_ids(ledger)
@@ -1067,7 +1086,7 @@ def run(args) -> dict:
     history: list[dict] = []
     cursor = 0
     carry: dict | None = None
-    dirty = bool(legacy)
+    dirty = bool(legacy) or healed
     refused = ""
     parked_until = 0
     last_batch_seconds = 0.0
@@ -1216,6 +1235,7 @@ def run(args) -> dict:
             log(f"final state publish failed: {error}")
     return {"repo": REPO, "revision": REVISION, "catalog": stats,
             "legacy_backfilled": legacy, "books_indexed": len(index["books"]),
+            "index_self_healed": healed, "index_still_unverified": still_stale,
             "by_status": dict(Counter(r.get("status", "?") for r in index["books"].values())),
             "candidates": len(candidates), "queue_scanned": len(queue),
             "batches": history, "refused": refused, "parked_until_epoch": parked_until,
@@ -1434,8 +1454,29 @@ def selftest() -> int:
         check("the marker commit keeps the previous checkpoint verifiable",
               written["last_commit"] == previous["last_commit"],
               f"last_commit={written['last_commit']}")
-        check("run() actually carries it, not just the helper",
-              "prime_last_commit" in run.__code__.co_names)
+        check("run() wires its startup helpers, not just defines them",
+              {"prime_last_commit", "heal_stale_rows"} <= set(run.__code__.co_names))
+
+        # The bookkeeping lag is proved and repaired in-memory: a stale row whose files are
+        # on the shelf becomes verified_remote; one whose files are not stays as it was.
+        stale_index = {"books": {"357": {"status": "uploaded_unverified",
+                                         "folder": "books/gutendex/0/357/en"},
+                                 "999": {"status": "uploaded_unverified",
+                                         "folder": "books/gutendex/0/999/en"}}}
+        real_existing = globals()["existing_books"]
+        globals()["existing_books"] = lambda api, ids: {357}
+        try:
+            healed_now, left = heal_stale_rows(fake, stale_index)
+        finally:
+            globals()["existing_books"] = real_existing
+        check("a stale row whose files are on the shelf is settled",
+              healed_now == 1 and left == 1
+              and stale_index["books"]["357"]["status"] == "verified_remote"
+              and bool(stale_index["books"]["357"].get("verified_at"))
+              and stale_index["books"]["999"]["status"] == "uploaded_unverified",
+              f"healed={healed_now} left={left}")
+        check("an index with no stale rows costs no lookup",
+              heal_stale_rows(fake, {"books": {"1": {"status": "verified_remote"}}}) == (0, 0))
 
         sleeps: list[float] = []
         time.sleep = lambda s: sleeps.append(s)

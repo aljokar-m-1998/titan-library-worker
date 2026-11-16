@@ -86,7 +86,23 @@ first batch cannot leave `--verify-last` with nothing to check.
 The park is a planned stop, so the job exits **0 (green)** with the reason kept in
 `refused`, `batches[-1].parked_until_utc` and `commit_budget.stopped_because`. If the
 marker itself cannot be written, the run has no guaranteed wait: it records
-`marker_write_failed` and exits **1**. A structural (non-quota) refusal also exits 1.
+`marker_write_failed` and exits **1**. A structural refusal also exits 1 — measured on
+2026-11-16 at 11:20:19Z, when the hub answered `500 Internal Server Error` for
+`POST /commit/main`: the batch rolled back, no marker was written, and the run stopped
+red. That is the correct shape: a hub outage is not a quota, and waiting until tomorrow
+would hide it.
+
+## Index self-heal
+
+A batch is written into `_worker/library_index.json` as `uploaded_unverified` *before*
+`remote_check` promotes it, so the promotion only ever ships in the next commit — and a
+later run never re-examines books it did not build itself. Without this, the last batch
+of every run stays `uploaded_unverified` forever (50 such rows survived from
+2026-11-15 until the heal landed). `heal_stale_rows()` asks the shelf once, with the
+same `existing_books()` probe used for candidates, and settles the rows whose files are
+really there. Rows whose files are **not** there are counted in
+`index_still_unverified` and left alone: they still sit in `ledger.json`, so retrying
+them would mean rewriting the ledger, which is a different change.
 
 ## Verification
 
@@ -96,7 +112,7 @@ text and `lfs.sha256` + size for images, and falls back to re-fetching CDN bytes
 a Xet-backed object exposes no LFS oid. `--verify-last` re-reads the checkpoint and
 verifies independently of the run that wrote it.
 
-`--self-test` is a network-free positive control: **39 assertions**. A synthetic
+`--self-test` is a network-free positive control: **41 assertions**. A synthetic
 Gutenberg fixture with a contents listing, a dedication and three real chapters must
 yield exactly three chapters with the right titles, plus known-answer vectors for the
 git blob sha1, the path guard and the strict `en` / `Text` filter. A stub api and a
@@ -104,9 +120,10 @@ frozen clock then prove the backoff contract: the park lands on the next UTC mid
 the report afterwards sends no further request, a run before the marker exits without
 one request, a run after it proceeds, a low window waits inside the run, a low window
 near the deadline stops instead, and the exit code is green for a marked park but red
-for an unmarked refusal. Two more checks pin the checkpoint carry: a refusal on the
-first batch must leave the previous run's `last_commit` expectations intact, so
-`--verify-last` still has something real to verify.
+for an unmarked refusal. Three more checks pin the state bookkeeping: a refusal on the
+first batch must leave the previous run's `last_commit` expectations intact, a stale
+`uploaded_unverified` row whose files are on the shelf gets settled and one whose files
+are *not* stays untouched, and `run()` must actually call both helpers.
 
 Hash equality proves the hub stores what the runner wrote, not that a reader can fetch
 it. The `audit the public shelf without a token` step closes that layer: it pulls
@@ -118,11 +135,38 @@ every chapter of the sampled book — the number the client sums. Gateway-era en
 reported as INFO rather than failed, because the client reads their word counts from
 `book.json`, never from the ledger.
 
+## Heartbeat
+
+`heartbeat.yml` runs at `:27` every hour and asks one question of the shelf, not of the
+clock: *has `M-hv1/Titan-Library` taken a commit within `stale_minutes` (default 180), is
+an ingest run already alive, and is the worker parked?* It dispatches `ingest.yml` only
+when all three say go, in that order, so a deliberate park until 00:00 UTC always wins.
+It reads three things — `_worker/backoff.json`, the workflow run list, and the dataset's
+newest commit date (parsed with `calendar.timegm`, because the hub's stamp is UTC and
+`time.mktime` would silently use the runner's zone) — and writes nothing.
+
+Two deliberate sharp edges:
+
+- **`GH_DISPATCH_TOKEN` must be a PAT**, not the repository token. `GITHUB_TOKEN`
+  returns `204 No Content` to a `workflow_dispatch` call and creates **no run at all**, so
+  the heartbeat ignores the HTTP answer and waits for a run id newer than the newest one
+  it saw before dispatching. Missing secret or silent dispatch both exit **1**.
+- **The heartbeat is itself a scheduled workflow**, so it is exposed to the same
+  best-effort dropping it exists to heal. The gain is that a missed window costs an hour
+  instead of four; it is damage control, not immunity.
+
+On 2026-11-16 GitHub created zero `schedule` run records across three eligible ingest
+windows (03:17 under the old cron, then 04:17 and 08:17 under `17 */4 * * *`) while the
+Actions status component read `operational`, the workflow was `active`, the copy of the
+file on `main` carried the right cron, and the run queue was empty.
+
 ## Running
 
 ```bash
 gh workflow run ingest.yml -f dry_run=true          # schema + cleaner, zero commits
 gh workflow run ingest.yml -f batch_size=25         # small remote test
+gh workflow run ingest.yml -f batch_size=100        # one scheduled-sized pump
+gh workflow run heartbeat.yml -f state_only=true    # show the verdict, dispatch nothing
 gh workflow run tts-switch.yml -f state=off         # retire gateway narration
 gh workflow run tts-switch.yml -f state=on          # restore it
 ```
@@ -133,6 +177,13 @@ the next one through `concurrency: titan-library-ingest` (`cancel-in-progress: f
 so the effective cadence is about 5h20m rather than 4h. Set the repository variable
 `INGEST_DRY_RUN=true` to make scheduled runs commit nothing.
 
+Measured on 2026-11-16 at these settings: **2.5 minutes per commit and 36 books per
+minute** (25 commits, 2,259 books, 58,781 files, 948 MB in 62.6 minutes, zero hash
+mismatches). At that rate the 320-minute budget would allow ~128 commits, but the scan
+window — `--batch-size × 40`, i.e. 4,000 candidates — closes the run near 110 minutes.
+**The scan is the binding constraint, not the clock**; widen it with `--scan` if a
+single run should ever approach the 500-commit ceiling.
+
 ## Secret
 
 `HF_TOKEN` must be able to **write the dataset** and **administer the Space**
@@ -141,6 +192,19 @@ so the effective cadence is about 5h20m rather than 4h. Set the repository varia
 ```bash
 gh secret set HF_TOKEN --repo aljokar-m-1998/titan-library-worker
 ```
+
+`GH_DISPATCH_TOKEN` belongs to `heartbeat.yml` only and must be a **personal access
+token with `Actions: Read and write` on this repository alone** — the repository's own
+`GITHUB_TOKEN` cannot trigger workflows (see Heartbeat). Set it before the heartbeat's
+first scheduled fire, or that run exits red with `GH_DISPATCH_TOKEN is not set`:
+
+```bash
+gh secret set GH_DISPATCH_TOKEN --repo aljokar-m-1998/titan-library-worker
+```
+
+Neither token is ever printed: the heartbeat puts its token into one `Authorization`
+header and nowhere else, and no `secrets.GITHUB_TOKEN` expression appears in any
+workflow file.
 
 > **Credential lifetime.** The token currently wired in is an OAuth access token
 > that expires on **2026-12-16**. It is not refreshed by GitHub Actions. Before that
