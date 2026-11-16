@@ -83,6 +83,8 @@ There is no assumed daily ceiling; the hub's own answer decides.
   it and clamps its backoff sleep to the time left, `build_book` propagates that status
   for both the text and the cover, and the batch ships what it already has.
   `batches[-1].cut_short` and `stopped_because_batch` say which guard fired.
+  The clock is armed **before the first request of the run**, so it also covers the
+  catalog feed and the startup reads, not just the books.
 
 ### Why the in-batch guard exists
 
@@ -95,6 +97,12 @@ the checkpoint stayed at `13:14:05Z` and the orphan python process was terminate
 The public shelf audit in that same cancelled run still passed every check
 (3,776 ledger entries = 3,776 catalog rows, `problems: []`), so the stall cost time,
 not data.
+
+The same day the **catalog feed itself** answered 503
+(`https://www.gutenberg.org/cache/epub/feeds/pg_catalog.csv.gz`). `load_catalog` raised
+`SystemExit` and the run exited 1 after burning ~25 minutes on that one URL, because the
+clock used to be armed *after* the catalog fetch. Arming it right after the
+`reserve_minutes` guard closes that gap: the feed now obeys the same deadline as a book.
 
 ### Smart backoff
 
@@ -134,6 +142,38 @@ really there. Rows whose files are **not** there are counted in
 `index_still_unverified` and left alone: they still sit in `ledger.json`, so retrying
 them would mean rewriting the ledger, which is a different change.
 
+## Orphan recovery
+
+A `create_commit` can answer **500 while the commit actually lands**. The batch path
+treats any exception as a refusal and rolls the books out of the in-memory index; the
+final state flush then publishes an index without them, and `existing_books()` skips
+them forever because their files are already on the shelf. Measured on 2026-11-16 at
+`11:17:27Z`: **100 books, ids 2821–2930**, present as files but invisible to the client.
+
+`recover_orphans()` runs at startup, **before `load_catalog`**, so a source outage cannot
+block it — it never touches Gutenberg:
+
+1. `shelf_book_folders()` enumerates the hub's own tree under `books/gutendex` in both
+   shapes. A bucket name can collide with a legacy book id (`11` is both), so a folder
+   holding `en` is a legacy book *and* its digit children are still bucket books.
+2. Anything on the shelf but absent from **both** the ledger and the index is an orphan.
+   Its row is rebuilt from its own `book.json` (title, author, subjects, chapter and word
+   counts, cover), and every chapter file it names must really be in the folder.
+3. `shelf_check()` re-fetches those files over the public CDN and recomputes the digests
+   from the bytes — git sha1 for text/json, sha256 for LFS images — then compares them
+   with what the hub recorded. Comparing the hub's `blob_id` against itself would prove
+   nothing. Any mismatch aborts the recovery without committing.
+4. One commit publishes the rebuilt rows, `ledger.json`, `catalog.parquet` and the resume
+   state, then `remote_check()` verifies that commit. The ledger entry keeps the book's
+   original `created_at` as `added_at`, and the index row carries `recovered`,
+   `recovered_at` and `first_created_at`. A refusal rolls the index and the ledger back
+   exactly like a batch refusal, and a quota refusal parks until the next UTC midnight.
+
+`RECOVER_LIMIT = 500` books per run; the rest are reported as `orphans_left` and picked up
+by the next run. `--dry-run` only counts them. The report carries `orphan_recovery` with
+`orphans_found`, `orphans_recovered`, `files_checked`, `files_verified`, `unreadable`,
+`half_present` (on the shelf and in exactly one of the two indexes) and `mismatches`.
+
 ## Verification
 
 `*.txt` and `*.json` are plain git blobs in this dataset; `*.jpg` and `*.parquet` are
@@ -142,7 +182,7 @@ text and `lfs.sha256` + size for images, and falls back to re-fetching CDN bytes
 a Xet-backed object exposes no LFS oid. `--verify-last` re-reads the checkpoint and
 verifies independently of the run that wrote it.
 
-`--self-test` is a network-free positive control: **49 assertions**. A synthetic
+`--self-test` is a network-free positive control: **60 assertions**. A synthetic
 Gutenberg fixture with a contents listing, a dedication and three real chapters must
 yield exactly three chapters with the right titles, plus known-answer vectors for the
 git blob sha1, the path guard and the strict `en` / `Text` filter. A stub api and a
@@ -163,6 +203,18 @@ ten seconds before the deadline sleeps exactly **10s**, not 300s, and then retur
 `deadline`; `build_book` propagates a deadlined text fetch and a deadlined cover fetch;
 and `run()` must reference both `FETCH_DEADLINE` and `out_of_time` and carry the
 `deadline` status in its own constants.
+
+Eleven more pin orphan recovery and the clock's position, on a stub shelf (a fake tree,
+a fake `get_paths_info` and a CDN stub) with `polite_get` replaced by a function that
+**raises if it is ever called**: the enumeration sees both folder shapes and the `11`
+bucket/id collision; a shelf with no orphans commits nothing and reads no bytes; the
+positive control rebuilds one orphan from its own `book.json`, publishes it in exactly
+one commit with the full ledger field set and zero state mismatches; the entry keeps the
+book's original `created_at`; a book already in the ledger is not duplicated; matching
+CDN bytes pass `shelf_check` while bytes that differ from the recorded blob id are
+flagged; a refused recovery commit rolls the index and the ledger back; and three
+source-order guards prove `run()` calls `recover_orphans`, wires both helpers, and arms
+`FETCH_DEADLINE` **before** `load_catalog`.
 
 Hash equality proves the hub stores what the runner wrote, not that a reader can fetch
 it. The `audit the public shelf without a token` step closes that layer: it pulls

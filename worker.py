@@ -64,6 +64,7 @@ TOC_RUN = 4
 CHAPTER_SANITY_CAP = 1200
 MAX_ATTEMPTS = 5
 DIR_ENTRY_LIMIT = 10_000
+RECOVER_LIMIT = 500  # orphan books one recovery commit may rebuild from the shelf
 
 STATE_HOOK: dict = {}
 
@@ -717,6 +718,31 @@ def existing_books(api, ids: list[int]) -> set[int]:
     return found
 
 
+def shelf_book_folders(api) -> dict[int, str]:
+    """Every book folder really on the shelf, in both shapes, from the hub's own tree.
+    A bucket name can collide with a legacy book id (11 is both), so a folder holding
+    'en' is a legacy book AND its digit children are still bucket books."""
+    folders: dict[int, str] = {}
+    for entry in api.list_repo_tree(REPO, path_in_repo=LEGACY_ROOT, repo_type="dataset",
+                                    revision=REVISION):
+        name = PurePosixPath(entry.path).name
+        if not name.isdigit():
+            continue
+        child = f"{LEGACY_ROOT}/{name}"
+        try:
+            sub = list(api.list_repo_tree(REPO, path_in_repo=child, repo_type="dataset",
+                                          revision=REVISION))
+        except (EntryNotFoundError, HfHubHTTPError):
+            continue
+        if any(PurePosixPath(e.path).name == "en" for e in sub):
+            folders[int(name)] = f"{child}/en"
+        for e in sub:
+            bid = PurePosixPath(e.path).name
+            if bid.isdigit():
+                folders[int(bid)] = f"{child}/{bid}/en"
+    return folders
+
+
 def backfill_legacy(api, index: dict, ledger: dict) -> int:
     """Index the books the gateway already stored, reading them from the dataset and
     never from Gutenberg, so catalog.parquet is complete and nothing is re-fetched."""
@@ -1031,6 +1057,46 @@ def remote_check(api, expected: dict[str, tuple[str, str, int]]) -> tuple[int, l
     return len(paths) - len(bad), bad
 
 
+def shelf_check(api, paths: list[str]) -> tuple[int, list[str], dict[str, int]]:
+    """Prove the CDN serves the bytes the hub recorded, for files this run did not write.
+    Comparing the hub's blob_id against itself would be vacuous: the digest is recomputed
+    from the fetched bytes."""
+    bad: list[str] = []
+    sizes: dict[str, int] = {}
+    info: dict[str, object] = {}
+    for start in range(0, len(paths), 500):
+        if start:
+            time.sleep(0.5)
+        for entry in api.get_paths_info(REPO, paths[start:start + 500], expand=True,
+                                        repo_type="dataset", revision=REVISION):
+            info[entry.path] = entry
+    for path in paths:
+        entry = info.get(path)
+        if entry is None:
+            bad.append(f"{path}: missing")
+        else:
+            sizes[path] = int(getattr(entry, "size", 0) or 0)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        fetched = list(pool.map(lambda p: (p, cdn_bytes(p)), paths))
+    for path, data in fetched:
+        entry = info.get(path)
+        if entry is None:
+            continue
+        if data is None:
+            bad.append(f"{path}: unreadable over the CDN")
+            continue
+        if path.lower().endswith(LFS_SUFFIXES):
+            digest = (getattr(getattr(entry, "lfs", None), "sha256", "") or "").lower()
+            if digest:
+                if hashlib.sha256(data).hexdigest() != digest:
+                    bad.append(f"{path}: CDN bytes differ from the recorded LFS oid")
+            elif data[:3] != b"\xff\xd8\xff":
+                bad.append(f"{path}: not a JPEG and no LFS oid to compare")
+        elif git_blob_sha1(data) != (getattr(entry, "blob_id", "") or "").lower():
+            bad.append(f"{path}: CDN bytes differ from the recorded blob id")
+    return len(paths) - len(bad), bad, sizes
+
+
 def verify_last(api) -> dict:
     raw = read_file(api, "_worker/library_checkpoint.json", required=True)
     checkpoint = json.loads(raw)
@@ -1043,6 +1109,140 @@ def verify_last(api) -> dict:
             "mismatch_sample": bad[:20], "commit": last.get("commit", ""),
             "books_indexed": checkpoint.get("books_indexed"),
             "by_status": checkpoint.get("by_status")}
+
+
+def recover_orphans(api, index: dict, ledger: dict, budget: Budget) -> dict:
+    """A commit the hub accepted while answering 500 leaves books on the shelf that our
+    rollback erased from the index, so the client never sees them. Rebuild their rows from
+    their own book.json -- never from Gutenberg -- and publish them in one commit before
+    any fetching starts, so a later stall cannot lose them again."""
+    folders = shelf_book_folders(api)
+    in_ledger = ledger_ids(ledger)
+    in_index = {int(k) for k in index["books"]}
+    missing = sorted(set(folders) - in_ledger - in_index)
+    report = {"orphans_found": len(missing), "orphans_recovered": 0,
+              "orphans_left": max(0, len(missing) - RECOVER_LIMIT),
+              "half_present": sorted((in_ledger ^ in_index) & set(folders))[:20],
+              "unreadable": [], "mismatches": []}
+    if not missing:
+        return report
+
+    items: list[dict] = []
+    paths: list[str] = []
+    created: dict[int, str] = {}
+    for gid in missing[:RECOVER_LIMIT]:
+        folder = folders[gid]
+        data = cdn_bytes(f"{folder}/book.json")
+        if data is None:
+            report["unreadable"].append(gid)
+            continue
+        try:
+            book = json.loads(data)
+        except json.JSONDecodeError:
+            report["unreadable"].append(gid)
+            continue
+        chapters = book.get("chapters") or []
+        if not chapters:
+            report["unreadable"].append(gid)
+            continue
+        try:
+            entries = list(api.list_repo_tree(REPO, path_in_repo=folder, repo_type="dataset",
+                                              revision=REVISION))
+        except (EntryNotFoundError, HfHubHTTPError):
+            report["unreadable"].append(gid)
+            continue
+        present = {PurePosixPath(e.path).name for e in entries}
+        wanted = [f"ch{int(c['chapter_number']):03d}_en.txt" for c in chapters] + ["book.json"]
+        if any(name not in present for name in wanted):
+            report["unreadable"].append(gid)
+            continue
+        items.append({"id": gid, "folder": folder,
+                      "title": book.get("title") or "", "author": book.get("author") or "",
+                      "subjects": book.get("subjects") or [],
+                      "bookshelves": book.get("bookshelves") or [],
+                      "chapters": len(chapters),
+                      "words": int(book.get("word_count") or 0),
+                      "chars": int(book.get("char_count") or 0),
+                      "cover": bool(book.get("cover")), "cover_url": book.get("cover") or "",
+                      "text_bytes": sum(int(c.get("text_bytes") or 0) for c in chapters),
+                      "text_sha256": "", "text_url": ""})
+        created[gid] = book.get("created_at") or ""
+        paths.extend(f"{folder}/{name}" for name in sorted(present))
+
+    verified, bad, sizes = shelf_check(api, paths)
+    report["files_checked"] = len(paths)
+    report["files_verified"] = verified
+    if bad:
+        report["mismatches"] = bad[:20]
+        return report
+    for item in items:
+        item["asset_bytes"] = sum(sizes.get(p, 0) for p in paths
+                                  if p.startswith(item["folder"] + "/"))
+
+    saved_books = dict(index["books"])
+    saved_queue = json.loads(json.dumps(ledger.get("queue", [])))
+    saved_updated = ledger.get("updated_at")
+    for item in items:
+        row = book_row(item, "verified_remote")
+        row["recovered"] = True
+        row["recovered_at"] = stamp()
+        row["verified_at"] = stamp()
+        if created.get(item["id"]):
+            row["first_created_at"] = created[item["id"]]
+        index["books"][str(item["id"])] = row
+    merge_ledger(ledger, items)
+    by_key = {e.get("key"): e for e in ledger["queue"]}
+    for item in items:
+        entry = by_key.get(f"gutendex-{item['id']}-en")
+        if entry is not None and created.get(item["id"]):
+            entry["added_at"] = created[item["id"]]
+
+    block = budget.allow()
+    if block:
+        budget.stop_reason = block
+        report["commit_blocked"] = block
+        return report
+    expected = expectations(
+        {"ledger.json": json.dumps(ledger, ensure_ascii=False).encode("utf-8")})
+    payload = state_files(index, ledger, budget, len(items), expected,
+                          budget.last_checkpoint.get("commit", ""))
+    expected["catalog.parquet"] = expectations(
+        {"catalog.parquet": payload["catalog.parquet"]})["catalog.parquet"]
+    offenders = sorted(name for name in payload if misplaced(name))
+    if offenders:
+        raise RuntimeError(f"recovery paths violate the sharding rule: {offenders[:5]}")
+    try:
+        commit = api.create_commit(
+            REPO, [CommitOperationAdd(path_in_repo=k, path_or_fileobj=v)
+                   for k, v in sorted(payload.items())],
+            commit_message=(f"library: recover {len(items)} orphan books from the shelf "
+                            f"+ ledger + catalog + resume state"),
+            repo_type="dataset", revision=REVISION)
+    except Exception as error:
+        index["books"] = saved_books
+        ledger["queue"] = saved_queue
+        ledger["updated_at"] = saved_updated
+        waited = looks_like_quota(str(error))
+        report["refused"] = (f"recovery commit refused "
+                             f"({'quota' if waited else type(error).__name__})")
+        budget.stop_reason = f"{report['refused']}: {str(error)[:300]}"
+        if waited:
+            try:
+                report["parked_until_epoch"] = save_backoff(api, budget)
+            except Exception as marker_error:
+                report["marker_write_failed"] = str(marker_error)[:300]
+        return report
+    commit_url = getattr(commit, "commit_url", "") or str(commit)[:80]
+    budget.record(len(payload), sum(len(d) for d in payload.values()),
+                  {"commit": commit_url, "books_indexed": len(index["books"]),
+                   "orphans_recovered": len(items)})
+    checked, mismatched = remote_check(api, expected)
+    STATE_HOOK["expected"] = expected
+    report.update({"orphans_recovered": len(items), "commit": commit_url,
+                   "state_files_verified": checked, "state_mismatches": mismatched[:20]})
+    if mismatched:
+        budget.stop_reason = f"{len(mismatched)} recovery state files did not verify remotely"
+    return report
 
 
 # ==============================================================
@@ -1061,14 +1261,35 @@ def run(args) -> dict:
         return {"refused": f"max_minutes {args.max_minutes} must exceed reserve_minutes "
                            f"{args.reserve_minutes}, otherwise no batch can start",
                 "batches": [], "commit_budget": budget.report()}
+    started = time.time()
+    budget.deadline = started + (args.max_minutes - args.reserve_minutes) * 60
+    FETCH_DEADLINE = budget.deadline
     carried = prime_last_commit(api, budget)
     index = load_state(api)
     ledger = load_ledger(api)
+    STATE_HOOK.clear()
+    STATE_HOOK.update({"api": api, "index": index, "ledger": ledger, "budget": budget,
+                       "expected": carried})
     legacy = backfill_legacy(api, index, ledger)
     healed, still_stale = heal_stale_rows(api, index)
     if healed or still_stale:
         log(f"index self-heal: {healed} stale rows re-verified from the shelf, "
             f"{still_stale} still unverified")
+    if args.dry_run:
+        folders = shelf_book_folders(api)
+        already = ledger_ids(ledger) | {int(k) for k in index["books"]}
+        recovery = {"orphans_found": len(set(folders) - already), "orphans_recovered": 0,
+                    "dry_run": True}
+    else:
+        recovery = recover_orphans(api, index, ledger, budget)
+    if recovery.get("orphans_found"):
+        log(f"orphan recovery: {recovery['orphans_recovered']}/{recovery['orphans_found']} "
+            f"rebuilt from the shelf, {len(recovery.get('unreadable') or [])} unreadable")
+    if recovery.get("refused"):
+        return {"repo": REPO, "revision": REVISION, "orphan_recovery": recovery,
+                "refused": recovery["refused"],
+                "parked_until_epoch": recovery.get("parked_until_epoch", 0),
+                "batches": [], "commit_budget": budget.report()}
     catalog, stats = load_catalog(args.fetch_interval)
     known = {int(k) for k, v in index["books"].items() if v.get("status") == "verified_remote"}
     known |= ledger_ids(ledger)
@@ -1091,21 +1312,16 @@ def run(args) -> dict:
                             "first_titles": (item.get("chapter_titles") or [])[:5],
                             "error": item.get("error")})
         return {"dry_run": True, "catalog": stats, "legacy_backfilled": legacy,
+                "orphan_recovery": recovery,
                 "books_indexed": len(index["books"]), "candidates": len(candidates),
                 "scanned": len(scan), "already_present": sorted(present),
                 "queue_head": [{"id": r["id"], "title": r["title"]} for r in queue[:10]],
                 "samples": samples, "commit_budget": budget.report()}
 
-    STATE_HOOK.clear()
-    STATE_HOOK.update({"api": api, "index": index, "ledger": ledger, "budget": budget,
-                       "expected": carried})
-    started = time.time()
-    budget.deadline = started + (args.max_minutes - args.reserve_minutes) * 60
-    FETCH_DEADLINE = budget.deadline
     history: list[dict] = []
     cursor = 0
     carry: dict | None = None
-    dirty = bool(legacy) or healed
+    dirty = bool(legacy) or healed or bool(recovery.get("orphans_recovered"))
     refused = ""
     parked_until = 0
     last_batch_seconds = 0.0
@@ -1262,7 +1478,8 @@ def run(args) -> dict:
         except Exception as error:
             log(f"final state publish failed: {error}")
     return {"repo": REPO, "revision": REVISION, "catalog": stats,
-            "legacy_backfilled": legacy, "books_indexed": len(index["books"]),
+            "legacy_backfilled": legacy, "orphan_recovery": recovery,
+            "books_indexed": len(index["books"]),
             "index_self_healed": healed, "index_still_unverified": still_stale,
             "by_status": dict(Counter(r.get("status", "?") for r in index["books"].values())),
             "candidates": len(candidates), "queue_scanned": len(queue),
@@ -1604,6 +1821,185 @@ def selftest() -> int:
             globals()["polite_get"] = real_polite
             globals()["FETCH_DEADLINE"] = real_deadline
             time.time, time.sleep = real_time, real_sleep
+
+        # A commit the hub accepted while answering 500 leaves books on the shelf that the
+        # rollback erased from the index, so the client never sees them. Recovery rebuilds
+        # those rows from the books' own book.json, proves the CDN bytes against the hub's
+        # digests, and publishes before any fetching starts.
+        class _Node:
+            def __init__(self, path):
+                self.path = path
+                self.size = 0
+
+        class _Lfs:
+            def __init__(self, data):
+                self.sha256 = hashlib.sha256(data).hexdigest()
+                self.size = len(data)
+
+        class _Info:
+            def __init__(self, path, data):
+                self.path = path
+                self.size = len(data)
+                self.lfs = _Lfs(data) if path.lower().endswith(LFS_SUFFIXES) else None
+                self.blob_id = "" if self.lfs else git_blob_sha1(data)
+
+        class _Shelf:
+            def __init__(self, tree, blobs, refuse=False):
+                self.tree, self.blobs = tree, blobs
+                self.commits = []
+                self.refuse = refuse
+
+            def list_repo_tree(self, repo, path_in_repo=None, **k):
+                return [_Node(p) for p in self.tree.get(path_in_repo, [])]
+
+            def get_paths_info(self, repo, paths, **k):
+                return [_Info(p, self.blobs[p]) for p in paths if p in self.blobs]
+
+            def create_commit(self, repo, operations, **k):
+                if self.refuse:
+                    raise RuntimeError("500 Internal Server Error")
+                for op in operations:
+                    self.blobs[op.path_in_repo] = op.path_or_fileobj
+                self.commits.append(k.get("commit_message", ""))
+                return "https://hub/recovered"
+
+        class _RecoverBudget:
+            def __init__(self):
+                self.used = 0
+                self.stop_reason = ""
+                self.last_checkpoint = {"commit": "https://hub/previous"}
+
+            def allow(self):
+                return ""
+
+            def record(self, files, uploaded_bytes, checkpoint):
+                self.used += 1
+
+            def report(self):
+                return {}
+
+        orphan_folder = book_folder(2821)
+        chapter_text = ("CHAPTER I\n\n" + "word " * 400).encode()
+        cover_bytes = b"\xff\xd8\xff" + b"cover" * 40
+        orphan_created = "2026-11-16T11:17:27+00:00"
+        orphan_book = {
+            "external_id": 2821, "language": "en", "title": "Orphan Book",
+            "author": "A. Writer", "subjects": ["Fiction"], "bookshelves": [],
+            "cover": RAW.format(repo=REPO, path=f"{orphan_folder}/cover.jpg"),
+            "char_count": len(chapter_text), "word_count": 401,
+            "created_at": orphan_created, "audio_available": False,
+            "chapters": [{"chapter_number": 1, "title": "CHAPTER I", "word_count": 401,
+                          "char_count": len(chapter_text), "text_bytes": len(chapter_text),
+                          "audio_urls": {}}],
+        }
+        pristine = {f"{orphan_folder}/book.json":
+                    json.dumps(orphan_book, ensure_ascii=False).encode(),
+                    f"{orphan_folder}/ch001_en.txt": chapter_text,
+                    f"{orphan_folder}/cover.jpg": cover_bytes}
+        simple_tree = {LEGACY_ROOT: [f"{LEGACY_ROOT}/2"],
+                       f"{LEGACY_ROOT}/2": [f"{LEGACY_ROOT}/2/2821"],
+                       orphan_folder: sorted(pristine)}
+        collision_tree = {
+            LEGACY_ROOT: [f"{LEGACY_ROOT}/2", f"{LEGACY_ROOT}/11", f"{LEGACY_ROOT}/notes.txt"],
+            f"{LEGACY_ROOT}/2": [f"{LEGACY_ROOT}/2/2821"],
+            f"{LEGACY_ROOT}/11": [f"{LEGACY_ROOT}/11/en", f"{LEGACY_ROOT}/11/11001"],
+            f"{LEGACY_ROOT}/11/11001": [f"{LEGACY_ROOT}/11/11001/en"],
+            orphan_folder: sorted(pristine)}
+        ledger_entry = {"key": "gutendex-2821-en", "source": "gutendex", "external_id": 2821,
+                        "language": "en"}
+        real_cdn = globals()["cdn_bytes"]
+        real_polite_recovery = globals()["polite_get"]
+        cdn_source = [dict(pristine)]
+        reads: list[str] = []
+
+        def serve(path):
+            reads.append(path)
+            return cdn_source[0].get(path)
+
+        def no_gutenberg(url, **k):
+            raise AssertionError(f"recovery must not touch Gutenberg: {url}")
+
+        globals()["cdn_bytes"] = serve
+        globals()["polite_get"] = no_gutenberg
+        try:
+            check("the shelf enumeration sees both shapes and the bucket/id collision",
+                  shelf_book_folders(_Shelf(collision_tree, dict(pristine))) == {
+                      2821: orphan_folder, 11: f"{LEGACY_ROOT}/11/en",
+                      11001: f"{LEGACY_ROOT}/11/11001/en"})
+
+            settled = _Shelf(simple_tree, dict(pristine))
+            reads.clear()
+            quiet = recover_orphans(settled, {"books": {"2821": {"status": "verified_remote"}}},
+                                    {"version": 1, "queue": [dict(ledger_entry)]},
+                                    _RecoverBudget())
+            check("a shelf with no orphans commits nothing and reads no bytes",
+                  quiet["orphans_found"] == 0 and settled.commits == [] and reads == [],
+                  f"found={quiet['orphans_found']} reads={len(reads)}")
+
+            recovered_index: dict = {"books": {}}
+            recovered_ledger = {"version": 1, "queue": [], "updated_at": ""}
+            shelf = _Shelf(simple_tree, dict(pristine))
+            probe_budget = _RecoverBudget()
+            recovered = recover_orphans(shelf, recovered_index, recovered_ledger, probe_budget)
+            entry = (recovered_ledger["queue"] or [{}])[0]
+            row = recovered_index["books"].get("2821", {})
+            needed = {"key", "source", "external_id", "language", "title", "author", "cover",
+                      "stage", "status", "chapters", "chapters_ready", "chars", "word_count"}
+            check("positive control: an orphan is rebuilt from its own book.json and published once",
+                  recovered["orphans_recovered"] == 1 and len(shelf.commits) == 1
+                  and probe_budget.used == 1 and needed <= set(entry)
+                  and row.get("status") == "verified_remote"
+                  and recovered.get("state_mismatches") == [],
+                  f"recovered={recovered['orphans_recovered']} commits={len(shelf.commits)} "
+                  f"absent={sorted(needed - set(entry))}")
+            check("the recovered entry keeps the book's original created_at",
+                  entry.get("added_at") == orphan_created
+                  and row.get("first_created_at") == orphan_created,
+                  f"added_at={entry.get('added_at')}")
+
+            only_ledger = {"version": 1, "queue": [dict(ledger_entry)], "updated_at": "x"}
+            dup = recover_orphans(_Shelf(simple_tree, dict(pristine)), {"books": {}},
+                                  only_ledger, _RecoverBudget())
+            check("a book already in the ledger is not duplicated",
+                  dup["orphans_found"] == 0 and len(only_ledger["queue"]) == 1,
+                  f"found={dup['orphans_found']} queue={len(only_ledger['queue'])}")
+
+            paths = sorted(pristine)
+            good, good_bad, sizes = shelf_check(_Shelf(simple_tree, dict(pristine)), paths)
+            check("positive control: matching CDN bytes pass the shelf check",
+                  good_bad == [] and good == len(paths)
+                  and all(sizes.get(p) == len(pristine[p]) for p in paths),
+                  f"bad={good_bad}")
+            tampered = dict(pristine)
+            tampered[f"{orphan_folder}/ch001_en.txt"] = b"bytes the hub never recorded"
+            cdn_source[0] = tampered
+            _good, liar_bad, _sizes = shelf_check(_Shelf(simple_tree, dict(pristine)), paths)
+            check("the shelf check flags CDN bytes that differ from the recorded blob id",
+                  any("differ from the recorded blob id" in b for b in liar_bad),
+                  f"bad={liar_bad}")
+            cdn_source[0] = dict(pristine)
+
+            refused_index: dict = {"books": {}}
+            refused_ledger = {"version": 1, "queue": [], "updated_at": ""}
+            angry = _Shelf(simple_tree, dict(pristine), refuse=True)
+            refused_report = recover_orphans(angry, refused_index, refused_ledger,
+                                             _RecoverBudget())
+            check("a refused recovery commit rolls the index and the ledger back",
+                  bool(refused_report.get("refused")) and refused_index["books"] == {}
+                  and refused_ledger["queue"] == [] and angry.commits == [],
+                  f"refused={refused_report.get('refused')}")
+
+            run_src = inspect.getsource(run)
+            check("run() recovers before it touches the catalog",
+                  run_src.index("recover_orphans(") < run_src.index("load_catalog("))
+            check("run() wires the recovery helpers, not just defines them",
+                  {"recover_orphans", "shelf_book_folders"} <= set(run.__code__.co_names))
+            check("run() arms the clock before the catalog fetch",
+                  run_src.index("FETCH_DEADLINE = budget.deadline")
+                  < run_src.index("load_catalog("))
+        finally:
+            globals()["cdn_bytes"] = real_cdn
+            globals()["polite_get"] = real_polite_recovery
 
         sleeps: list[float] = []
         time.sleep = lambda s: sleeps.append(s)
