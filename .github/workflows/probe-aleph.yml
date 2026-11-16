@@ -27,6 +27,8 @@ jobs:
           URLS = [
               ("aleph-feed", "https://aleph.gutenberg.org/cache/epub/feeds/pg_catalog.csv.gz"),
               ("aleph-book", "https://aleph.gutenberg.org/cache/epub/2821/pg2821.txt.utf8"),
+              ("aleph-http-feed", "http://aleph.gutenberg.org/cache/epub/feeds/pg_catalog.csv.gz"),
+              ("aleph-http-book", "http://aleph.gutenberg.org/cache/epub/2821/pg2821.txt.utf8"),
               ("www-feed", "https://www.gutenberg.org/cache/epub/feeds/pg_catalog.csv.gz"),
           ]
           rows = []
