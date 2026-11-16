@@ -173,6 +173,8 @@ block it — it never touches Gutenberg:
 by the next run. `--dry-run` only counts them. The report carries `orphan_recovery` with
 `orphans_found`, `orphans_recovered`, `files_checked`, `files_verified`, `unreadable`,
 `half_present` (on the shelf and in exactly one of the two indexes) and `mismatches`.
+An abort **logs its reason at the moment it happens**: a run that later dies on the
+catalog feed never prints its final report, so a reason kept only in that report is lost.
 
 ## Verification
 
@@ -182,7 +184,7 @@ text and `lfs.sha256` + size for images, and falls back to re-fetching CDN bytes
 a Xet-backed object exposes no LFS oid. `--verify-last` re-reads the checkpoint and
 verifies independently of the run that wrote it.
 
-`--self-test` is a network-free positive control: **60 assertions**. A synthetic
+`--self-test` is a network-free positive control: **61 assertions**. A synthetic
 Gutenberg fixture with a contents listing, a dedication and three real chapters must
 yield exactly three chapters with the right titles, plus known-answer vectors for the
 git blob sha1, the path guard and the strict `en` / `Text` filter. A stub api and a

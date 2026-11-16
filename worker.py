@@ -1174,6 +1174,8 @@ def recover_orphans(api, index: dict, ledger: dict, budget: Budget) -> dict:
     report["files_verified"] = verified
     if bad:
         report["mismatches"] = bad[:20]
+        log(f"orphan recovery aborted: {len(bad)} of {len(paths)} shelf files failed "
+            f"verification, nothing committed; first: {bad[:3]}")
         return report
     for item in items:
         item["asset_bytes"] = sum(sizes.get(p, 0) for p in paths
@@ -1201,6 +1203,7 @@ def recover_orphans(api, index: dict, ledger: dict, budget: Budget) -> dict:
     if block:
         budget.stop_reason = block
         report["commit_blocked"] = block
+        log(f"orphan recovery could not commit: {block}")
         return report
     expected = expectations(
         {"ledger.json": json.dumps(ledger, ensure_ascii=False).encode("utf-8")})
@@ -1977,6 +1980,19 @@ def selftest() -> int:
             check("the shelf check flags CDN bytes that differ from the recorded blob id",
                   any("differ from the recorded blob id" in b for b in liar_bad),
                   f"bad={liar_bad}")
+            logged = io.StringIO()
+            real_stderr = sys.stderr
+            sys.stderr = logged
+            try:
+                aborted = recover_orphans(_Shelf(simple_tree, dict(pristine)), {"books": {}},
+                                          {"version": 1, "queue": [], "updated_at": ""},
+                                          _RecoverBudget())
+            finally:
+                sys.stderr = real_stderr
+            check("an aborted recovery logs its reason instead of losing it in the report",
+                  aborted["orphans_recovered"] == 0 and "aborted" in logged.getvalue()
+                  and "differ from the recorded blob id" in logged.getvalue(),
+                  f"log={logged.getvalue()[:100]!r}")
             cdn_source[0] = dict(pristine)
 
             refused_index: dict = {"books": {}}
