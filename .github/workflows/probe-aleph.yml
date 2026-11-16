@@ -1,0 +1,61 @@
+name: probe the aleph Gutenberg mirror
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: titan-library-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: probe three URLs, 256 bytes each
+        run: |
+          python - <<'PY' > probe-aleph.json
+          import json, sys, time, urllib.error, urllib.request
+
+          UA = {"User-Agent": "titan-library-worker/1.0 (mirror probe)"}
+          URLS = [
+              ("aleph-feed", "https://aleph.gutenberg.org/cache/epub/feeds/pg_catalog.csv.gz"),
+              ("aleph-book", "https://aleph.gutenberg.org/cache/epub/2821/pg2821.txt.utf8"),
+              ("www-feed", "https://www.gutenberg.org/cache/epub/feeds/pg_catalog.csv.gz"),
+          ]
+          rows = []
+          for label, url in URLS:
+              row = {"label": label, "url": url}
+              started = time.time()
+              try:
+                  with urllib.request.urlopen(urllib.request.Request(url, headers=UA),
+                                              timeout=45) as response:
+                      head = response.read(256)
+                      row.update(status=response.status, bytes_read=len(head),
+                                 content_type=response.headers.get("Content-Type", ""),
+                                 content_length=response.headers.get("Content-Length", ""),
+                                 retry_after=response.headers.get("Retry-After", ""),
+                                 gzip_magic=head[:2] == b"\x1f\x8b",
+                                 first_bytes=head[:16].hex())
+              except urllib.error.HTTPError as error:
+                  row.update(status=error.code, error=str(error)[:200],
+                             retry_after=(error.headers or {}).get("Retry-After", ""))
+              except Exception as error:
+                  row.update(error=f"{type(error).__name__}: {error}"[:200])
+              row["seconds"] = round(time.time() - started, 2)
+              rows.append(row)
+              print(f"{label}: {row}", file=sys.stderr, flush=True)
+          print(json.dumps({"probed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "results": rows}, indent=1))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: probe-aleph-${{ github.run_number }}
+          path: probe-aleph.json
