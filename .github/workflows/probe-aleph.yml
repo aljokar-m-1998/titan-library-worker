@@ -25,10 +25,11 @@ jobs:
 
           UA = {"User-Agent": "titan-library-worker/1.0 (mirror probe)"}
           URLS = [
-              ("aleph-feed", "https://aleph.gutenberg.org/cache/epub/feeds/pg_catalog.csv.gz"),
-              ("aleph-book", "https://aleph.gutenberg.org/cache/epub/2821/pg2821.txt.utf8"),
-              ("aleph-http-feed", "http://aleph.gutenberg.org/cache/epub/feeds/pg_catalog.csv.gz"),
-              ("aleph-http-book", "http://aleph.gutenberg.org/cache/epub/2821/pg2821.txt.utf8"),
+              ("apex-feed", "https://gutenberg.org/cache/epub/feeds/pg_catalog.csv.gz"),
+              ("www-book", "https://www.gutenberg.org/cache/epub/2821/pg2821.txt.utf8"),
+              ("www-cover", "https://www.gutenberg.org/cache/epub/2821/pg2821.cover.medium.jpg"),
+              ("aleph-http-flat", "http://aleph.gutenberg.org/2821/2821.txt"),
+              ("aleph-http-dirs", "http://aleph.gutenberg.org/2/8/2/2821/2821.txt"),
               ("www-feed", "https://www.gutenberg.org/cache/epub/feeds/pg_catalog.csv.gz"),
           ]
           rows = []
