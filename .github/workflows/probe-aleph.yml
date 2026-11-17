@@ -57,8 +57,151 @@ jobs:
           print(json.dumps({"probed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                             "results": rows}, indent=1))
           PY
+      - name: measure the three aleph gaps, read only
+        run: |
+          python - <<'PY' > aleph-gaps.json
+          import codecs, csv, gzip, io, json, re, sys, time, urllib.error, urllib.request
+
+          UA = {"User-Agent": "titan-library-worker/1.0 (aleph gap probe)"}
+          BASE = "http://aleph.gutenberg.org"
+          BOOK = "2/8/2/2821"
+          REQUIRED = {"Text#", "Type", "Language", "Title", "Authors"}
+          OPTIONAL = {"Subjects", "Bookshelves", "Issued"}
+          MAX_CATALOG_BYTES = 64 * 1024 * 1024
+          out = {"probed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                 "catalog": {}, "directory": {}, "texts": [], "covers": []}
+
+          def open_url(url, timeout=180):
+              return urllib.request.urlopen(urllib.request.Request(url, headers=UA),
+                                            timeout=timeout)
+
+          def head(url, limit=256):
+              row = {"url": url}
+              started = time.time()
+              try:
+                  with open_url(url, timeout=60) as response:
+                      data = response.read(limit)
+                      row.update(status=response.status, bytes_read=len(data),
+                                 content_type=response.headers.get("Content-Type", ""),
+                                 content_length=response.headers.get("Content-Length", ""),
+                                 first_bytes=data[:16].hex())
+              except urllib.error.HTTPError as error:
+                  row.update(status=error.code, error=str(error)[:160])
+              except Exception as error:
+                  row.update(error=f"{type(error).__name__}: {error}"[:160])
+              row["seconds"] = round(time.time() - started, 2)
+              print(f"{url} -> {row}", file=sys.stderr, flush=True)
+              return row
+
+          # gap 3 - the catalog, parsed exactly the way load_catalog parses it
+          row = {"url": f"{BASE}/cache/epub/feeds/pg_catalog.csv.gz"}
+          started = time.time()
+          try:
+              with open_url(row["url"]) as response:
+                  row["status"] = response.status
+                  row["content_length"] = response.headers.get("Content-Length", "")
+                  packed = response.read()
+              raw = gzip.decompress(packed)
+              row.update(compressed_bytes=len(packed), csv_bytes=len(raw),
+                         within_worker_cap=len(packed) <= MAX_CATALOG_BYTES)
+              reader = csv.DictReader(io.StringIO(raw.decode("utf-8-sig")))
+              columns = reader.fieldnames or []
+              row["columns"] = columns
+              row["required_missing"] = sorted(REQUIRED - set(columns))
+              row["optional_missing"] = sorted(OPTIONAL - set(columns))
+              rows = english = 0
+              ids = set()
+              first = None
+              for record in reader:
+                  rows += 1
+                  if first is None:
+                      first = {k: (v or "")[:120] for k, v in record.items()}
+                  if ((record.get("Type") or "").strip().lower() == "text"
+                          and (record.get("Language") or "").strip().lower() == "en"):
+                      english += 1
+                      try:
+                          gid = int((record.get("Text#") or "").strip())
+                      except ValueError:
+                          continue
+                      if gid > 0:
+                          ids.add(gid)
+              row.update(rows=rows, english_text=english, unique_ids=len(ids),
+                         max_id=max(ids) if ids else 0, first_row=first)
+          except urllib.error.HTTPError as error:
+              row.update(status=error.code, error=str(error)[:200])
+          except Exception as error:
+              row["error"] = f"{type(error).__name__}: {error}"[:200]
+          row["seconds"] = round(time.time() - started, 2)
+          out["catalog"] = row
+          print("catalog: " + json.dumps({k: v for k, v in row.items()
+                                         if k not in ("first_row", "columns")}),
+                file=sys.stderr, flush=True)
+
+          # gaps 1 and 2 - the book's own directory listing names every format it has
+          row = {"url": f"{BASE}/{BOOK}/"}
+          started = time.time()
+          try:
+              with open_url(row["url"], timeout=60) as response:
+                  row["status"] = response.status
+                  row["content_type"] = response.headers.get("Content-Type", "")
+                  body = response.read(65536).decode("utf-8", "replace")
+              names = re.findall(r'href="([^"?/][^"]*)"', body)
+              row.update(entry_count=len(names), entries=names[:80],
+                         has_cover=[n for n in names if "cover" in n.lower()],
+                         has_utf8=[n for n in names
+                                   if "utf8" in n.lower() or n.endswith("-0.txt")])
+          except urllib.error.HTTPError as error:
+              row.update(status=error.code, error=str(error)[:160])
+          except Exception as error:
+              row.update(error=f"{type(error).__name__}: {error}"[:160])
+          row["seconds"] = round(time.time() - started, 2)
+          out["directory"] = row
+          print(f"directory: {row}", file=sys.stderr, flush=True)
+
+          # gap 2 - is the served text actually UTF-8, or the latin-1 original?
+          for name in ("2821.txt", "2821-0.txt", "2821.txt.utf8"):
+              row = {"url": f"{BASE}/{BOOK}/{name}"}
+              started = time.time()
+              try:
+                  with open_url(row["url"], timeout=60) as response:
+                      row["status"] = response.status
+                      row["content_type"] = response.headers.get("Content-Type", "")
+                      row["content_length"] = response.headers.get("Content-Length", "")
+                      sample = response.read(65536)
+                  row["sample_bytes"] = len(sample)
+                  row["non_ascii_bytes"] = sum(1 for b in sample if b > 127)
+                  # final=False: a multi-byte character cut by the 64 KiB sample is not
+                  # an encoding error, and calling it one would invent a gap
+                  decoder = codecs.getincrementaldecoder("utf-8")()
+                  try:
+                      text = decoder.decode(sample, False)
+                      row["utf8_valid"] = True
+                  except UnicodeDecodeError as error:
+                      row["utf8_valid"] = False
+                      row["utf8_error"] = str(error)[:120]
+                      text = sample.decode("latin-1")
+                  row["first_chars"] = text[:80]
+              except urllib.error.HTTPError as error:
+                  row.update(status=error.code, error=str(error)[:160])
+              except Exception as error:
+                  row.update(error=f"{type(error).__name__}: {error}"[:160])
+              row["seconds"] = round(time.time() - started, 2)
+              out["texts"].append(row)
+              print(f"text: {row}", file=sys.stderr, flush=True)
+
+          # gap 1 - the two cover layouts worth naming, since aleph has no www cache tree
+          for url in (f"{BASE}/cache/epub/2821/pg2821.cover.medium.jpg",
+                      f"{BASE}/{BOOK}/2821-cover.jpg"):
+              row = head(url)
+              row["jpeg"] = row.get("first_bytes", "").startswith("ffd8ff")
+              out["covers"].append(row)
+
+          print(json.dumps(out, ensure_ascii=False, indent=1))
+          PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: probe-aleph-${{ github.run_number }}
-          path: probe-aleph.json
+          path: |
+            probe-aleph.json
+            aleph-gaps.json
