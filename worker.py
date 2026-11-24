@@ -38,6 +38,10 @@ from huggingface_hub.errors import EntryNotFoundError, HfHubHTTPError
 REPO = os.environ.get("HF_LIBRARY_DATASET_REPO", "M-hv1/Titan-Library")
 REVISION = os.environ.get("HF_LIBRARY_DATASET_REVISION", "main")
 CATALOG_URL = "https://www.gutenberg.org/cache/epub/feeds/pg_catalog.csv.gz"
+CATALOG_CACHE_PATH = "_worker/pg_catalog.csv.gz"
+CATALOG_CACHE_META_PATH = "_worker/pg_catalog_meta.json"
+CATALOG_CACHE_MAX_AGE_SECONDS = 7 * 86400
+GUTENDEX_CATALOG_URL = "https://gutendex.com/books?languages=en&mime_type=text%2Fplain"
 UA = {"User-Agent": "TitanLibrary-CloudIngest/1.0 "
                     "(+https://github.com/aljokar-m-1998/titan-library-worker)"}
 GUTENBERG_HOSTS = {"gutenberg.org", "www.gutenberg.org", "aleph.gutenberg.org"}
@@ -62,7 +66,8 @@ MIN_CHAPTER_CHARS = 1_200
 TOC_GAP_CHARS = 200
 TOC_RUN = 4
 CHAPTER_SANITY_CAP = 1200
-MAX_ATTEMPTS = 5
+MAX_ATTEMPTS = 4
+MAX_RETRY_DELAY = 60.0
 DIR_ENTRY_LIMIT = 10_000
 RECOVER_LIMIT = 500  # orphan books one recovery commit may rebuild from the shelf
 
@@ -586,14 +591,14 @@ def polite_get(url: str, *, limit: int, interval: float, kind: str) -> dict:
     for attempt in range(1, MAX_ATTEMPTS + 1):
         if out_of_time():
             return {"status": "deadline", "error": "run deadline reached"}
-        delay = min(2 ** attempt, 60)
+        delay = min(15.0 * (2 ** (attempt - 1)), MAX_RETRY_DELAY)
         wait = interval - (time.monotonic() - _LAST_FETCH)
         if wait > 0:
             time.sleep(wait)
         _LAST_FETCH = time.monotonic()
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers=UA),
-                                        timeout=120) as response:
+                                        timeout=60) as response:
                 final_url = response.geturl()
                 declared = int(response.headers.get("Content-Length") or 0)
                 data = response.read(limit + 1)
@@ -616,13 +621,17 @@ def polite_get(url: str, *, limit: int, interval: float, kind: str) -> dict:
                 return {"status": "failed", "error": last}
             retry = (error.headers or {}).get("Retry-After") or ""
             if retry.isdigit():
-                delay = min(float(retry), 3600)
+                delay = min(max(float(retry), delay), MAX_RETRY_DELAY)
         except (urllib.error.URLError, OSError, TimeoutError) as error:
             last = f"{type(error).__name__}: {error}"
+        if attempt >= MAX_ATTEMPTS:
+            log(f"{kind} {url} attempt {attempt}/{MAX_ATTEMPTS}: {last} - giving up")
+            break
         if FETCH_DEADLINE:
             delay = min(delay, max(0.0, FETCH_DEADLINE - time.time()))
         log(f"{kind} {url} attempt {attempt}/{MAX_ATTEMPTS}: {last} - sleep {delay:.0f}s")
-        time.sleep(delay)
+        if delay > 0:
+            time.sleep(delay)
     return {"status": "failed", "error": last}
 
 
@@ -635,16 +644,13 @@ def split_list(value: str | None) -> list[str]:
     return [" ".join(part.split()) for part in (value or "").split(";") if part.strip()]
 
 
-def load_catalog(interval: float) -> tuple[list[dict], dict]:
-    result = polite_get(CATALOG_URL, limit=MAX_CATALOG_BYTES, interval=interval, kind="catalog")
-    if result["status"] != "ok":
-        raise SystemExit(f"catalog unavailable: {result}")
-    raw = gzip.decompress(result["data"])
+def parse_pg_catalog_gz(gz_bytes: bytes) -> tuple[list[dict], dict]:
+    raw = gzip.decompress(gz_bytes)
     reader = csv.DictReader(io.StringIO(raw.decode("utf-8-sig")))
     columns = reader.fieldnames or []
     missing = {"Text#", "Type", "Language", "Title", "Authors"} - set(columns)
     if missing:
-        raise SystemExit(f"catalog columns changed; missing {sorted(missing)} in {columns}")
+        raise ValueError(f"catalog columns changed; missing {sorted(missing)} in {columns}")
     rows: list[dict] = []
     stats: Counter = Counter()
     for row in reader:
@@ -669,6 +675,154 @@ def load_catalog(interval: float) -> tuple[list[dict], dict]:
     rows.sort(key=lambda r: r["id"])
     stats["unique_ids"] = len({r["id"] for r in rows})
     return rows, {"columns": columns, **stats}
+
+
+def _maybe_refresh_hf_catalog_cache(api, gz_bytes: bytes) -> bool:
+    """Refresh _worker/pg_catalog.csv.gz on HF when absent or older than 7 days."""
+    if api is None:
+        return False
+    meta_raw = read_file(api, CATALOG_CACHE_META_PATH)
+    if meta_raw:
+        try:
+            meta = json.loads(meta_raw)
+            age = time.time() - float(meta.get("fetched_at_epoch") or 0)
+            if age < CATALOG_CACHE_MAX_AGE_SECONDS:
+                return False
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+    now_epoch = int(time.time())
+    meta_bytes = json.dumps(
+        {
+            "fetched_at_epoch": now_epoch,
+            "fetched_at": stamp(),
+            "bytes": len(gz_bytes),
+            "sha256": hashlib.sha256(gz_bytes).hexdigest(),
+        },
+        indent=1,
+    ).encode("utf-8")
+    try:
+        api.create_commit(
+            REPO,
+            [
+                CommitOperationAdd(path_in_repo=CATALOG_CACHE_PATH, path_or_fileobj=gz_bytes),
+                CommitOperationAdd(path_in_repo=CATALOG_CACHE_META_PATH, path_or_fileobj=meta_bytes),
+            ],
+            commit_message="library: refresh cached pg_catalog.csv.gz",
+            repo_type="dataset",
+            revision=REVISION,
+        )
+        log(f"refreshed HF catalog cache ({len(gz_bytes)} bytes)")
+        return True
+    except Exception as error:
+        log(f"WARN: failed to refresh HF catalog cache: {str(error)[:160]}")
+        return False
+
+
+def _load_gutendex_catalog_fallback(interval: float, *, max_pages: int = 15) -> list[dict]:
+    """Paginate gutendex.com/books as a last-resort fallback when pg_catalog is unreachable."""
+    rows: list[dict] = []
+    seen: set[int] = set()
+    next_url: str | None = GUTENDEX_CATALOG_URL
+    pages = 0
+    while next_url and pages < max_pages:
+        if out_of_time():
+            break
+        data = None
+        for attempt in range(1, 4):
+            if out_of_time():
+                break
+            try:
+                req = urllib.request.Request(next_url, headers=UA)
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+                break
+            except Exception as error:
+                if attempt >= 3:
+                    log(f"gutendex fallback {next_url} failed: {error}")
+                    break
+                delay = min(15.0 * (2 ** (attempt - 1)), MAX_RETRY_DELAY)
+                if FETCH_DEADLINE:
+                    delay = min(delay, max(0.0, FETCH_DEADLINE - time.time()))
+                if delay > 0:
+                    time.sleep(delay)
+        if not isinstance(data, dict):
+            break
+        pages += 1
+        for book in data.get("results") or []:
+            try:
+                gid = int(book.get("id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if gid <= 0 or gid in seen:
+                continue
+            if (book.get("media_type") or "Text").lower() != "text":
+                continue
+            langs = [str(l).lower() for l in (book.get("languages") or [])]
+            if langs and "en" not in langs:
+                continue
+            seen.add(gid)
+            authors = [
+                " ".join((a.get("name") or "").split())
+                for a in (book.get("authors") or [])
+                if isinstance(a, dict) and a.get("name")
+            ]
+            rows.append(
+                {
+                    "id": gid,
+                    "title": " ".join((book.get("title") or "").split()),
+                    "author": "; ".join(authors),
+                    "subjects": [s for s in (book.get("subjects") or []) if isinstance(s, str)],
+                    "bookshelves": [b for b in (book.get("bookshelves") or []) if isinstance(b, str)],
+                    "issued": "",
+                }
+            )
+        next_url = data.get("next")
+        if next_url and interval > 0:
+            time.sleep(min(interval, 1.0))
+    rows.sort(key=lambda r: r["id"])
+    return rows
+
+
+def load_catalog(
+    interval: float,
+    *,
+    api=None,
+    allow_cache_refresh: bool = False,
+) -> tuple[list[dict], dict]:
+    result = polite_get(CATALOG_URL, limit=MAX_CATALOG_BYTES, interval=interval, kind="catalog")
+    if result["status"] == "ok":
+        rows, stats = parse_pg_catalog_gz(result["data"])
+        if allow_cache_refresh and api is not None:
+            _maybe_refresh_hf_catalog_cache(api, result["data"])
+        return rows, {"source": "gutenberg_feed", **stats}
+
+    log(f"WARN: live pg_catalog unavailable ({result}); checking HF cache {CATALOG_CACHE_PATH}")
+    cached = read_file(api, CATALOG_CACHE_PATH) if api is not None else cdn_bytes(CATALOG_CACHE_PATH)
+    if cached:
+        try:
+            rows, stats = parse_pg_catalog_gz(cached)
+            log(f"using HF cached pg_catalog.csv.gz ({len(rows)} English text rows)")
+            return rows, {"source": "hf_cache", **stats}
+        except Exception as error:
+            log(f"WARN: HF cached pg_catalog invalid ({error})")
+
+    log("WARN: HF catalog cache unavailable; falling back to gutendex.com/books")
+    fallback_rows = _load_gutendex_catalog_fallback(interval)
+    if fallback_rows:
+        log(f"using gutendex.com/books fallback ({len(fallback_rows)} English text rows)")
+        return fallback_rows, {
+            "source": "gutendex_fallback",
+            "english_text": len(fallback_rows),
+            "unique_ids": len(fallback_rows),
+        }
+
+    log("WARN: all catalog sources unreachable after fast retries; exiting cleanly")
+    return [], {
+        "source": "unavailable",
+        "error": result.get("error", "unreachable"),
+        "english_text": 0,
+        "unique_ids": 0,
+    }
 
 
 # ==============================================================
@@ -1323,7 +1477,17 @@ def run(args) -> dict:
                 "refused": recovery["refused"],
                 "parked_until_epoch": recovery.get("parked_until_epoch", 0),
                 "batches": [], "commit_budget": budget.report()}
-    catalog, stats = load_catalog(args.fetch_interval)
+    catalog, stats = load_catalog(
+        args.fetch_interval,
+        api=api,
+        allow_cache_refresh=not args.dry_run,
+    )
+    if not catalog and stats.get("source") == "unavailable":
+        return {"repo": REPO, "revision": REVISION, "catalog_unavailable": True,
+                "catalog": stats, "legacy_backfilled": legacy, "orphan_recovery": recovery,
+                "books_indexed": len(index["books"]), "batches": [],
+                "commit_budget": budget.report(),
+                "minutes": round((time.time() - started) / 60, 1)}
     known = {int(k) for k, v in index["books"].items() if v.get("status") == "verified_remote"}
     known |= ledger_ids(ledger)
     candidates = [row for row in catalog if row["id"] not in known]
@@ -1827,8 +1991,8 @@ def selftest() -> int:
                   got["status"] == "deadline" and fetch_sleeps == [10.0] and len(calls) == 1,
                   f"status={got['status']} sleeps={fetch_sleeps} calls={len(calls)}")
 
-            # The source itself asked for 3600s on 2026-11-16; cutting that to 300 meant
-            # five refusals in 25 minutes instead of one polite wait.
+            # Transient 503/Retry-After must use fast exponential backoff (15s->30s->60s)
+            # and never sleep 3600s or waste a sleep after the final attempt.
             def retry_after(value):
                 def stub(req, timeout=None):
                     calls.append(req.full_url)
@@ -1843,17 +2007,23 @@ def selftest() -> int:
             fetch_sleeps.clear()
             calls.clear()
             got = real_polite(feed, limit=1000, interval=0.0, kind="catalog")
-            check("a one-hour Retry-After is honored, not cut to five minutes",
+            check("a 3600s Retry-After is capped at 60s with fast exponential backoff",
                   got["status"] == "failed" and len(calls) == MAX_ATTEMPTS
-                  and fetch_sleeps == [3600.0] * MAX_ATTEMPTS,
-                  f"sleeps={fetch_sleeps[:2]} calls={len(calls)}")
-            urllib.request.urlopen = retry_after(7200)
+                  and fetch_sleeps == [60.0] * (MAX_ATTEMPTS - 1),
+                  f"sleeps={fetch_sleeps} calls={len(calls)}")
+
+            def plain_503(req, timeout=None):
+                calls.append(req.full_url)
+                raise urllib.error.HTTPError(req.full_url, 503, "unavailable", {}, None)
+
+            urllib.request.urlopen = plain_503
             fetch_sleeps.clear()
             calls.clear()
             got = real_polite(feed, limit=1000, interval=0.0, kind="catalog")
-            check("a Retry-After beyond an hour is capped at one hour",
-                  fetch_sleeps == [3600.0] * MAX_ATTEMPTS,
-                  f"sleeps={fetch_sleeps[:2]}")
+            check("plain 503 uses 15s -> 30s -> 60s exponential backoff",
+                  got["status"] == "failed" and len(calls) == MAX_ATTEMPTS
+                  and fetch_sleeps == [15.0, 30.0, 60.0],
+                  f"sleeps={fetch_sleeps} calls={len(calls)}")
             globals()["polite_get"] = lambda url, **k: {
                 "status": "deadline", "error": "run deadline reached"}
             item = build_book({"id": 1, "title": "t"}, interval=0.0)
